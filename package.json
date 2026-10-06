@@ -1,0 +1,37 @@
+{
+  "name": "slskd-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A local MCP server for slskd. First milestone: connection status.",
+  "engines": {
+    "node": "^22.13.0 || >=24.0.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node --env-file-if-exists=.env dist/src/index.js",
+    "test": "tsc && node --test dist/test/*.test.js",
+    "check:connection": "tsc && node --env-file-if-exists=.env dist/scripts/check-connection.js",
+    "lint": "eslint . --max-warnings 0",
+    "lint:fix": "eslint . --fix --max-warnings 0",
+    "format": "prettier . --write",
+    "format:check": "prettier . --check",
+    "typecheck": "tsc --noEmit",
+    "check": "eslint . --max-warnings 0 && prettier . --check && tsc && node --test dist/test/*.test.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.3.1",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@modelcontextprotocol/client": "2.3.1",
+    "@types/node": "26.6.4",
+    "eslint": "10.12.0",
+    "eslint-config-prettier": "10.1.8",
+    "globals": "17.13.0",
+    "prettier": "3.9.9",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.71.1"
+  }
+}
