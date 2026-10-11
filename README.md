@@ -49,7 +49,7 @@ Example result:
 }
 ```
 
-A disconnected Soulseek session returns a successful status result with `readyToSearch: false`. Missing-credential, authentication, network, timeout and response-format failures return MCP `isError: true` and a concise error code. Raw HTTP error bodies are never returned. Redirects are not followed.
+A disconnected Soulseek session returns a successful status result with `readyToSearch: false`. Missing-credential, authentication, network, timeout and response-format failures return MCP `isError: true` and a concise error code. All JSON responses, including connection status, are limited to 32 MiB. Raw HTTP error bodies are never returned. Redirects are not followed.
 
 ## Search
 
@@ -331,7 +331,7 @@ TypeScript and typescript-eslint are pinned to compatible versions. Update them 
 
 ## Client structure
 
-`src/index.ts` reads the environment once, creates a configured slskd client, and passes it to the MCP server. Status, search, peer, and download operations retain their shared HTTP client in closures. Operation calls accept arguments and an optional cancellation signal; they do not read environment variables. Each client keeps its own configuration snapshot, so tests can create independent clients without changing global state.
+`src/index.ts` reads the environment once, creates a configured slskd client, and passes it to the MCP server. Status, search, peer, and download operations retain their shared HTTP client in closures. Operation calls accept arguments and an optional cancellation signal; they do not read environment variables. Each client retains the supplied readonly configuration, so tests can create independent clients without changing global state.
 
 ```ts
 const config = readConfig(process.env);
@@ -341,12 +341,12 @@ const server = createServer(slskd);
 await slskd.searchList({ queryContains: 'artist' }, signal);
 ```
 
-Changing configuration requires constructing a new client. The HTTP transport owns credentials, URL prefixes, ordinary and peer request deadlines, and response/error handling.
+To use different settings, parse configuration and construct a new client. The HTTP transport owns credentials, URL prefixes, ordinary and peer request deadlines, and response/error handling.
 
 ## Files
 
 - `src/status.ts`: existing connection-status projection.
-- `src/config.ts`: environment parsing and validated, immutable configuration.
+- `src/config.ts`: environment parsing and validated configuration with readonly types.
 - `src/client.ts`: configured slskd client combining status, search, peer, and download operations.
 - `src/http.ts`, `src/errors.ts`: shared HTTP transport and sanitized errors.
 - `src/search.ts`, `src/files.ts`: search and lifecycle tools, runtime schemas, filters, sorting, and pages.
@@ -359,7 +359,7 @@ Changing configuration requires constructing a new client. The HTTP transport ow
 - `scripts/check-search-lifecycle.ts`: narrated start/list/stop/read/delete smoke client.
 - `scripts/check-browse.ts`: narrated peer info/library/directory smoke client.
 - `scripts/check-download.ts`: narrated selected-file download smoke client.
-- `test/client.test.ts`: client isolation, configuration snapshots, missing credentials, and startup diagnostics.
+- `test/client.test.ts`: client isolation, environment independence, missing credentials, and startup diagnostics.
 - `test/downloads.test.ts`: download contracts, failures, and stdio tests.
 - `test/status.test.ts`, `test/search.test.ts`, `test/lifecycle.test.ts`, `test/peers.test.ts`: fake-HTTP and real-stdio regression tests.
 

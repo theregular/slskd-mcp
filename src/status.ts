@@ -11,10 +11,9 @@ const serverState = z.object({
 
 export function createStatusOperations(client: HttpClient) {
   async function connectionStatus() {
-    const signal = AbortSignal.timeout(client.timeout);
     const [rawState, rawVersion] = await Promise.all([
-      client.request('/server', { signal, legacyStatus: true }),
-      client.request('/application/version', { signal, legacyStatus: true }),
+      client.request('/server'),
+      client.request('/application/version'),
     ]);
 
     const state = serverState.safeParse(rawState);

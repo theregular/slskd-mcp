@@ -9,7 +9,7 @@ import { createSlskdClient } from '../src/client.js';
 
 const id = '550e8400-e29b-41d4-a716-446655440000';
 
-test('clients retain their own URL, credentials and configuration after caller mutations', async (t) => {
+test('clients use independent configurations without retaining the input environment', async (t) => {
   const requests: string[] = [];
   const server = createServer((req, res) => {
     const prefix = req.url?.startsWith('/first/') ? 'first' : 'second';
@@ -35,17 +35,13 @@ test('clients retain their own URL, credentials and configuration after caller m
   assert(address && typeof address !== 'string');
   const base = `http://127.0.0.1:${address.port}`;
   const env = { SLSKD_URL: `${base}/first/`, SLSKD_API_KEY: 'first-fixture-key' };
-  const parsed = readConfig(env);
-  const config = { ...parsed, headers: { ...parsed.headers } };
-  const first = createSlskdClient(config);
+  const first = createSlskdClient(readConfig(env));
 
   env.SLSKD_URL = 'http://127.0.0.1:1';
   env.SLSKD_API_KEY = 'changed-environment';
-  config.base = `${base}/second`;
-  config.headers['X-API-Key'] = 'second-fixture-key';
-  const second = createSlskdClient(config);
-  config.base = 'http://127.0.0.1:1';
-  config.headers['X-API-Key'] = 'changed-configuration';
+  const second = createSlskdClient(
+    readConfig({ SLSKD_URL: `${base}/second`, SLSKD_API_KEY: 'second-fixture-key' }),
+  );
 
   // Detached methods keep their configured client without requiring a bound `this`.
   const { searchList } = first;

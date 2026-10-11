@@ -11,7 +11,7 @@ export type RequestOptions = {
   body?: unknown;
   signal?: AbortSignal;
   operationId?: string;
-  legacyStatus?: boolean;
+  usePeerTimeout?: boolean;
 };
 
 async function boundedJson(response: Response): Promise<unknown> {
@@ -62,12 +62,14 @@ async function requestJson(
 
   const method = options.method ?? 'GET';
   const mutates = method !== 'GET' && !options.readOnly;
-  const deadline = AbortSignal.timeout(config.timeout);
+  const deadline = AbortSignal.timeout(
+    options.usePeerTimeout ? config.peerTimeout : config.timeout,
+  );
   const signal = options.signal ? AbortSignal.any([deadline, options.signal]) : deadline;
   const timeoutError = () =>
     new SlskdError(
-      !options.legacyStatus && options.signal?.aborted ? 'CANCELLED' : 'TIMEOUT',
-      !options.legacyStatus && options.signal?.aborted
+      options.signal?.aborted ? 'CANCELLED' : 'TIMEOUT',
+      options.signal?.aborted
         ? 'The request was cancelled.'
         : 'slskd did not finish its response before the request timeout.',
     );
@@ -118,31 +120,27 @@ async function requestJson(
     if (response.status === 404) {
       throw new SlskdError(
         'NOT_FOUND',
-        options.legacyStatus
-          ? 'slskd API endpoint not found. Use its base URL, including any URL prefix, but omit /api/v0.'
-          : 'The requested slskd resource or API endpoint is unavailable.',
+        'The requested slskd resource or API endpoint is unavailable.',
       );
     }
-    if (!options.legacyStatus) {
-      if (response.status === 400) {
-        throw new SlskdError('INVALID_ARGUMENT', 'slskd rejected the request arguments.');
-      }
-      if (response.status === 409) {
-        throw new SlskdError(
-          'CONFLICT',
-          'slskd could not perform this operation in its current state.',
-          options.operationId ? { operationId: options.operationId } : {},
-        );
-      }
-      if (response.status === 429) {
-        const header = response.headers.get('retry-after');
-        const seconds = header && /^\d+$/.test(header) ? Number(header) : NaN;
-        throw new SlskdError(
-          'RATE_LIMITED',
-          'slskd is limiting requests. No retry was attempted.',
-          Number.isSafeInteger(seconds) ? { retryAfterSeconds: seconds } : {},
-        );
-      }
+    if (response.status === 400) {
+      throw new SlskdError('INVALID_ARGUMENT', 'slskd rejected the request arguments.');
+    }
+    if (response.status === 409) {
+      throw new SlskdError(
+        'CONFLICT',
+        'slskd could not perform this operation in its current state.',
+        options.operationId ? { operationId: options.operationId } : {},
+      );
+    }
+    if (response.status === 429) {
+      const header = response.headers.get('retry-after');
+      const seconds = header && /^\d+$/.test(header) ? Number(header) : NaN;
+      throw new SlskdError(
+        'RATE_LIMITED',
+        'slskd is limiting requests. No retry was attempted.',
+        Number.isSafeInteger(seconds) ? { retryAfterSeconds: seconds } : {},
+      );
     }
     if (mutates && (response.status >= 500 || response.status === 408)) {
       throw unknownOutcome(options.operationId);
@@ -159,7 +157,7 @@ async function requestJson(
   }
 
   try {
-    return options.legacyStatus ? await response.json() : await boundedJson(response);
+    return await boundedJson(response);
   } catch (error) {
     if (mutates) {
       throw unknownOutcome(options.operationId);
@@ -178,14 +176,11 @@ async function requestJson(
 }
 
 export function createHttpClient(config: SlskdConfig) {
-  const snapshot = Object.freeze({ ...config, headers: Object.freeze({ ...config.headers }) });
-  const peerConfig = Object.freeze({ ...snapshot, timeout: snapshot.peerTimeout });
-
-  return Object.freeze({
-    timeout: snapshot.timeout,
-    request: (path: string, options?: RequestOptions) => requestJson(snapshot, path, options),
-    requestPeer: (path: string, options?: RequestOptions) => requestJson(peerConfig, path, options),
-  });
+  return {
+    request: (path: string, options?: RequestOptions) => requestJson(config, path, options),
+    requestPeer: (path: string, options?: RequestOptions) =>
+      requestJson(config, path, { ...options, usePeerTimeout: true }),
+  };
 }
 
 export type HttpClient = ReturnType<typeof createHttpClient>;

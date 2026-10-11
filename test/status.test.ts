@@ -5,7 +5,8 @@ import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import { createSlskdClient } from '../src/client.js';
 import { fileURLToPath } from 'node:url';
-import { readConfig, type Environment } from '../src/config.js';
+import { readConfig } from '../src/config.js';
+import { MAX_RESPONSE_BYTES } from '../src/http.js';
 
 type Handler = (req: IncomingMessage, res: ServerResponse) => void;
 
@@ -30,7 +31,7 @@ function response(res: ServerResponse, data: unknown) {
 }
 
 const key = 'test-secret-must-not-leak';
-const envFor = (url: string): Environment => ({ SLSKD_URL: url, SLSKD_API_KEY: key });
+const envFor = (url: string) => ({ SLSKD_URL: url, SLSKD_API_KEY: key });
 const clientFor = (base: string) => createSlskdClient(readConfig(envFor(base)));
 
 test('validates configuration without revealing credentials', () => {
@@ -117,6 +118,9 @@ test('bearer session authentication works', async () => {
 });
 
 for (const [httpStatus, code] of [
+  [400, 'INVALID_ARGUMENT'],
+  [409, 'CONFLICT'],
+  [429, 'RATE_LIMITED'],
   [401, 'UNAUTHORIZED'],
   [403, 'FORBIDDEN'],
   [404, 'NOT_FOUND'],
@@ -154,20 +158,47 @@ test('rejects invalid JSON and unexpected response shapes', async () => {
   }
 });
 
-test('applies a bounded request timeout', async () => {
-  await fixture(
-    () => {},
-    async (base) => {
-      await assert.rejects(
-        createSlskdClient(
-          readConfig({ ...envFor(base), SLSKD_TIMEOUT_MS: '100' }),
-        ).connectionStatus(),
-        {
-          code: 'TIMEOUT',
-        },
-      );
-    },
-  );
+test('HTTP client deadlines report TIMEOUT before headers and during body reads', async () => {
+  for (const partialBody of [false, true]) {
+    await fixture(
+      (_req, res) => {
+        if (partialBody) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.write('{');
+        }
+      },
+      async (base) => {
+        const slskd = createSlskdClient(readConfig({ ...envFor(base), SLSKD_TIMEOUT_MS: '100' }));
+        await assert.rejects(slskd.connectionStatus(), { code: 'TIMEOUT' });
+      },
+    );
+  }
+});
+
+test('both status endpoints use the shared response size limit', async () => {
+  for (const endpoint of ['/server', '/application/version']) {
+    await fixture(
+      (req, res) => {
+        if (req.url === `/api/v0${endpoint}`) {
+          res.writeHead(200, { 'Content-Length': String(MAX_RESPONSE_BYTES + 1) });
+          res.end('x');
+        } else {
+          response(
+            res,
+            req.url?.endsWith('/version')
+              ? '0.26.0'
+              : {
+                  isConnected: true,
+                  isLoggedIn: true,
+                },
+          );
+        }
+      },
+      async (base) => {
+        await assert.rejects(clientFor(base).connectionStatus(), { code: 'RESPONSE_TOO_LARGE' });
+      },
+    );
+  }
 });
 
 test('does not follow redirects carrying credentials', async () => {
