@@ -18,7 +18,7 @@ try {
   await client.connect(transport);
 
   const { tools } = await client.listTools();
-  if (tools.length !== 1 || tools[0]?.name !== 'connection_status')
+  if (!tools.some((tool) => tool.name === 'connection_status'))
     throw new Error('Unexpected tool list.');
 
   const result = await client.callTool({ name: 'connection_status', arguments: {} });

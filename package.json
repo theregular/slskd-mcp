@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "A local MCP server for slskd. First milestone: connection status.",
+  "description": "A local TypeScript MCP server for slskd connection status and Soulseek searches.",
   "engines": {
     "node": "^22.13.0 || >=24.0.0"
   },
@@ -17,7 +17,11 @@
     "format": "prettier . --write",
     "format:check": "prettier . --check",
     "typecheck": "tsc --noEmit",
-    "check": "eslint . --max-warnings 0 && prettier . --check && tsc && node --test dist/test/*.test.js"
+    "check": "eslint . --max-warnings 0 && prettier . --check && tsc && node --test dist/test/*.test.js",
+    "check:search": "tsc && node --env-file-if-exists=.env dist/scripts/check-search.js",
+    "check:lifecycle": "tsc && node --env-file-if-exists=.env dist/scripts/check-search-lifecycle.js",
+    "check:browse": "tsc && node --env-file-if-exists=.env dist/scripts/check-browse.js",
+    "check:download": "tsc && node --env-file-if-exists=.env dist/scripts/check-download.js"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "2.3.1",

@@ -178,7 +178,7 @@ test('does not follow redirects carrying credentials', async () => {
   );
 });
 
-test('real stdio MCP advertises one read-only tool and calls it', async () => {
+test('real stdio MCP retains the read-only status contract', async () => {
   await fixture(
     (req, res) =>
       response(
@@ -200,7 +200,22 @@ test('real stdio MCP advertises one read-only tool and calls it', async () => {
         const { tools } = await client.listTools();
         assert.deepEqual(
           tools.map((t) => t.name),
-          ['connection_status'],
+          [
+            'connection_status',
+            'search_start',
+            'search_results',
+            'search_list',
+            'search_stop',
+            'search_delete',
+            'browse_user',
+            'browse_directory',
+            'user_info',
+            'download_queue',
+            'download_list',
+            'download_status',
+            'download_cancel',
+            'download_clear_completed',
+          ],
         );
         assert.equal(tools[0]?.annotations?.readOnlyHint, true);
 
