@@ -6,20 +6,15 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
-import {
-  browseUser,
-  browseDirectory,
-  userInfo,
-  browseUserOutput,
-  browseDirectoryOutput,
-  userInfoOutput,
-} from '../src/peers.js';
-import { readConfig, readPeerConfig } from '../src/config.js';
-import { MAX_RESPONSE_BYTES } from '../src/client.js';
+import { createSlskdClient } from '../src/client.js';
+import { browseUserOutput, browseDirectoryOutput, userInfoOutput } from '../src/peers.js';
+import { readConfig } from '../src/config.js';
+import { MAX_RESPONSE_BYTES } from '../src/http.js';
 import { SlskdError, errorResult } from '../src/errors.js';
 
 const key = 'private-fixture-key';
 const envFor = (base: string) => ({ SLSKD_URL: base, SLSKD_API_KEY: key });
+const clientFor = (base: string) => createSlskdClient(readConfig(envFor(base)));
 const username = ' Péér/#?% 音楽 ';
 const directory = 'Music\\Écho [live]\\Disc 1 ';
 const file = (filename = '01 曲.flac', extra = {}) => ({
@@ -54,17 +49,16 @@ async function fixture(
   }
 }
 
-test('peer deadlines are independent of the ordinary request deadline and validate only when used', () => {
+test('peer deadlines are independent of ordinary deadlines and validated when configuration is read', () => {
   const env = envFor('http://127.0.0.1:5030');
-  assert.equal(readPeerConfig(env).timeout, 30000);
+  assert.equal(readConfig(env).peerTimeout, 30000);
   for (const value of ['100', '120000']) {
-    assert.equal(readPeerConfig({ ...env, SLSKD_PEER_TIMEOUT_MS: value }).timeout, Number(value));
+    assert.equal(readConfig({ ...env, SLSKD_PEER_TIMEOUT_MS: value }).peerTimeout, Number(value));
   }
   for (const value of ['0', '99', '120001', 'NaN', '1.5', '']) {
-    assert.throws(() => readPeerConfig({ ...env, SLSKD_PEER_TIMEOUT_MS: value }), {
+    assert.throws(() => readConfig({ ...env, SLSKD_PEER_TIMEOUT_MS: value }), {
       code: 'CONFIG_ERROR',
     });
-    assert.equal(readConfig({ ...env, SLSKD_PEER_TIMEOUT_MS: value }).timeout, 5000);
   }
 });
 
@@ -81,9 +75,9 @@ test('browse returns compact sorted unlocked summaries with literal filtering an
       });
     },
     async (base) => {
-      const env = envFor(base + '/prefix/');
+      const slskd = clientFor(base + '/prefix/');
       const result = browseUserOutput.parse(
-        await browseUser({ username, directoryContains: '[LIVE]', limit: 1 }, env),
+        await slskd.browseUser({ username, directoryContains: '[LIVE]', limit: 1 }),
       );
       assert.deepEqual(result.items, [{ directory: 'A [live]', fileCount: 0 }]);
       assert.equal(result.username, username);
@@ -92,12 +86,12 @@ test('browse returns compact sorted unlocked summaries with literal filtering an
       assert(!JSON.stringify(result).includes('filename'));
       assert(!JSON.stringify(result).includes(key));
       assert.deepEqual(
-        (await browseUser({ username, directoryContains: '[LIVE]', offset: 1, limit: 1 }, env))
+        (await slskd.browseUser({ username, directoryContains: '[LIVE]', offset: 1, limit: 1 }))
           .items,
         [{ directory: 'Z [live]', fileCount: 1 }],
       );
-      assert.equal((await browseUser({ username, directoryContains: '.*' }, env)).matchedCount, 0);
-      assert.deepEqual((await browseUser({ username, offset: 100 }, env)).items, []);
+      assert.equal((await slskd.browseUser({ username, directoryContains: '.*' })).matchedCount, 0);
+      assert.deepEqual((await slskd.browseUser({ username, offset: 100 })).items, []);
     },
   );
 });
@@ -127,7 +121,7 @@ test('directory POST preserves exact identity and composes paths before filters,
       ]);
     },
     async (base) => {
-      const env = envFor(base + '/prefix');
+      const slskd = clientFor(base + '/prefix');
       const filtered = {
         username,
         directory,
@@ -139,7 +133,7 @@ test('directory POST preserves exact identity and composes paths before filters,
         },
       };
       const result = browseDirectoryOutput.parse(
-        await browseDirectory({ ...filtered, offset: 1, limit: 1 }, env),
+        await slskd.browseDirectory({ ...filtered, offset: 1, limit: 1 }),
       );
       assert.equal(result.directory, directory);
       assert.equal(result.matchedCount, 2);
@@ -147,12 +141,12 @@ test('directory POST preserves exact identity and composes paths before filters,
       assert.equal(result.items[0]?.username, username);
       assert.equal(result.items[0]?.durationSeconds, null);
       assert.equal(result.items[0]?.sampleRateHz, 44100);
-      const all = await browseDirectory({ username, directory }, env);
+      const all = await slskd.browseDirectory({ username, directory });
       assert.equal(all.matchedCount, 5);
       assert.equal(all.items[0]?.filename, directory + '\\01 曲.flac');
       assert.equal(all.items[0]?.extension, 'flac');
       assert.equal(all.items[0]?.bitRateKbps, null);
-      assert.deepEqual((await browseDirectory({ ...filtered, offset: 100 }, env)).items, []);
+      assert.deepEqual((await slskd.browseDirectory({ ...filtered, offset: 100 })).items, []);
     },
   );
 });
@@ -168,8 +162,10 @@ test('remote path composition preserves Unicode, spaces, dot components and exis
     await fixture(
       (_req, res) => json(res, [dir(name)]),
       async (base) => {
+        const slskd = clientFor(base);
+
         assert.equal(
-          (await browseDirectory({ username, directory: name }, envFor(base))).items[0]?.filename,
+          (await slskd.browseDirectory({ username, directory: name })).items[0]?.filename,
           expected,
         );
       },
@@ -182,17 +178,18 @@ test('empty directory and library succeed; mismatched paths and malformed shapes
     await fixture(
       (_req, res) => json(res, payload),
       async (base) => {
-        assert.equal(
-          (await browseDirectory({ username, directory }, envFor(base))).matchedCount,
-          0,
-        );
+        const slskd = clientFor(base);
+
+        assert.equal((await slskd.browseDirectory({ username, directory })).matchedCount, 0);
       },
     );
   }
   await fixture(
     (_req, res) => json(res, { directories: [] }),
     async (base) => {
-      assert.equal((await browseUser({ username }, envFor(base))).matchedCount, 0);
+      const slskd = clientFor(base);
+
+      assert.equal((await slskd.browseUser({ username })).matchedCount, 0);
     },
   );
   for (const payload of [
@@ -205,7 +202,9 @@ test('empty directory and library succeed; mismatched paths and malformed shapes
     await fixture(
       (_req, res) => json(res, payload),
       async (base) => {
-        await assert.rejects(browseDirectory({ username, directory }, envFor(base)), {
+        const slskd = clientFor(base);
+
+        await assert.rejects(slskd.browseDirectory({ username, directory }), {
           code: 'INVALID_RESPONSE',
         });
       },
@@ -215,7 +214,9 @@ test('empty directory and library succeed; mismatched paths and malformed shapes
     await fixture(
       (_req, res) => json(res, payload),
       async (base) => {
-        await assert.rejects(browseUser({ username }, envFor(base)), { code: 'INVALID_RESPONSE' });
+        const slskd = clientFor(base);
+
+        await assert.rejects(slskd.browseUser({ username }), { code: 'INVALID_RESPONSE' });
       },
     );
   }
@@ -229,13 +230,13 @@ test('peer inputs reject unsafe identities and unknown arguments before network 
       res.end();
     },
     async (base) => {
-      const env = envFor(base);
-      for (const fn of [browseUser, userInfo]) {
+      const slskd = clientFor(base);
+      for (const fn of ['browseUser', 'userInfo'] as const) {
         for (const value of ['', '  ', '.', '..', '\ud800', 'x'.repeat(501)]) {
-          await assert.rejects(fn({ username: value }, env), { code: 'INVALID_ARGUMENT' });
+          await assert.rejects(slskd[fn]({ username: value }), { code: 'INVALID_ARGUMENT' });
         }
-        await assert.rejects(fn({ username, url: base }, env), { code: 'INVALID_ARGUMENT' });
-        await assert.rejects(fn({ username }, env, AbortSignal.abort()), { code: 'CANCELLED' });
+        await assert.rejects(slskd[fn]({ username, url: base }), { code: 'INVALID_ARGUMENT' });
+        await assert.rejects(slskd[fn]({ username }, AbortSignal.abort()), { code: 'CANCELLED' });
       }
       for (const raw of [
         { username, directory: ' ' },
@@ -244,9 +245,9 @@ test('peer inputs reject unsafe identities and unknown arguments before network 
         { username, directory, recursive: true },
         { username, directory, filters: { regex: '.*' } },
       ]) {
-        await assert.rejects(browseDirectory(raw, env), { code: 'INVALID_ARGUMENT' });
+        await assert.rejects(slskd.browseDirectory(raw), { code: 'INVALID_ARGUMENT' });
       }
-      await assert.rejects(browseDirectory({ username, directory }, env, AbortSignal.abort()), {
+      await assert.rejects(slskd.browseDirectory({ username, directory }, AbortSignal.abort()), {
         code: 'CANCELLED',
       });
       assert.equal(calls, 0);
@@ -275,7 +276,9 @@ test('info maps presence, bounds descriptions without splitting emoji, and drops
       }
     },
     async (base) => {
-      const result = userInfoOutput.parse(await userInfo({ username }, envFor(base)));
+      const slskd = clientFor(base);
+
+      const result = userInfoOutput.parse(await slskd.userInfo({ username }));
       assert.equal(result.status, 'Away');
       assert.equal(Array.from(result.description!).length, 2000);
       assert.equal(result.descriptionTruncated, true);
@@ -292,7 +295,9 @@ test('info maps presence, bounds descriptions without splitting emoji, and drops
   await fixture(
     (_req, res) => json(res, {}),
     async (base) => {
-      const result = await userInfo({ username }, envFor(base));
+      const slskd = clientFor(base);
+
+      const result = await slskd.userInfo({ username });
       assert.equal(result.status, null);
       assert.equal(result.description, null);
       assert.equal(result.uploadSlots, null);
@@ -315,7 +320,9 @@ test('info requires both requests to succeed and validates consumed metadata', a
         }
       },
       async (base) => {
-        await assert.rejects(userInfo({ username }, envFor(base)), { code: 'NOT_FOUND' });
+        const slskd = clientFor(base);
+
+        await assert.rejects(slskd.userInfo({ username }), { code: 'NOT_FOUND' });
       },
     );
   }
@@ -329,28 +336,32 @@ test('info requires both requests to succeed and validates consumed metadata', a
     await fixture(
       (_req, res) => json(res, payload),
       async (base) => {
-        await assert.rejects(userInfo({ username }, envFor(base)), { code: 'INVALID_RESPONSE' });
+        const slskd = clientFor(base);
+
+        await assert.rejects(slskd.userInfo({ username }), { code: 'INVALID_RESPONSE' });
       },
     );
   }
 });
 
-for (const fn of [browseUser, browseDirectory, userInfo]) {
-  const args = fn === browseDirectory ? { username, directory } : { username };
-  test(`${fn.name} uses peer deadlines through body reads and respects cancellation`, async () => {
+for (const fn of ['browseUser', 'browseDirectory', 'userInfo'] as const) {
+  const args = fn === 'browseDirectory' ? { username, directory } : { username };
+  test(`${fn} uses peer deadlines through body reads and respects cancellation`, async () => {
     await fixture(
       async (req, res) => {
         await delay(150);
-        if (fn === browseUser) {
+        if (fn === 'browseUser') {
           json(res, { directories: [] });
-        } else if (fn === browseDirectory) {
+        } else if (fn === 'browseDirectory') {
           json(res, []);
         } else {
           json(res, req.url?.endsWith('/info') ? {} : { presence: 'Online' });
         }
       },
       async (base) => {
-        await fn(args, { ...envFor(base), SLSKD_TIMEOUT_MS: '100', SLSKD_PEER_TIMEOUT_MS: '1000' });
+        await createSlskdClient(
+          readConfig({ ...envFor(base), SLSKD_TIMEOUT_MS: '100', SLSKD_PEER_TIMEOUT_MS: '1000' }),
+        )[fn](args);
       },
     );
     await fixture(
@@ -359,11 +370,18 @@ for (const fn of [browseUser, browseDirectory, userInfo]) {
         res.write('{');
       },
       async (base) => {
-        await assert.rejects(fn(args, { ...envFor(base), SLSKD_PEER_TIMEOUT_MS: '100' }), {
-          code: 'TIMEOUT',
-        });
+        const slskd = clientFor(base);
+
+        await assert.rejects(
+          createSlskdClient(readConfig({ ...envFor(base), SLSKD_PEER_TIMEOUT_MS: '100' }))[fn](
+            args,
+          ),
+          {
+            code: 'TIMEOUT',
+          },
+        );
         const abort = new AbortController();
-        const pending = fn(args, envFor(base), abort.signal);
+        const pending = slskd[fn](args, abort.signal);
         const timer = setTimeout(() => abort.abort(), 30);
         try {
           await assert.rejects(pending, { code: 'CANCELLED' });
@@ -395,15 +413,14 @@ test('directory POST errors retain read semantics, sanitized failures, and no re
         }
       },
       async (base) => {
-        await assert.rejects(
-          browseDirectory({ username, directory }, envFor(base)),
-          (error: unknown) => {
-            assert(error instanceof SlskdError);
-            assert.equal(error.code, code);
-            assert(!JSON.stringify(errorResult(error)).includes(key));
-            return true;
-          },
-        );
+        const slskd = clientFor(base);
+
+        await assert.rejects(slskd.browseDirectory({ username, directory }), (error: unknown) => {
+          assert(error instanceof SlskdError);
+          assert.equal(error.code, code);
+          assert(!JSON.stringify(errorResult(error)).includes(key));
+          return true;
+        });
         assert.equal(calls, 1);
       },
     );
@@ -411,7 +428,7 @@ test('directory POST errors retain read semantics, sanitized failures, and no re
 });
 
 test('browse and read-only directory POST reject oversized declared and chunked bodies', async () => {
-  for (const fn of [browseUser, browseDirectory]) {
+  for (const fn of ['browseUser', 'browseDirectory'] as const) {
     for (const advertised of [true, false]) {
       await fixture(
         async (_req, res) => {
@@ -429,8 +446,10 @@ test('browse and read-only directory POST reject oversized declared and chunked 
           }
         },
         async (base) => {
+          const slskd = clientFor(base);
+
           await assert.rejects(
-            fn(fn === browseUser ? { username } : { username, directory }, envFor(base)),
+            slskd[fn](fn === 'browseUser' ? { username } : { username, directory }),
             { code: 'RESPONSE_TOO_LARGE' },
           );
         },

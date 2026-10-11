@@ -1,6 +1,5 @@
 import { z } from 'zod';
-import { readPeerConfig, type Environment } from './config.js';
-import { requestJson } from './client.js';
+import { type HttpClient } from './http.js';
 import { SlskdError } from './errors.js';
 import {
   compareText,
@@ -111,24 +110,6 @@ function userPath(username: string) {
   return `/users/${encodeURIComponent(username)}`;
 }
 
-export async function browseUser(
-  raw: unknown,
-  env: Environment = process.env,
-  signal?: AbortSignal,
-) {
-  const args = parse(browseUserInput, raw, 'INVALID_ARGUMENT');
-  const response = await requestJson(readPeerConfig(env), `${userPath(args.username)}/browse`, {
-    signal,
-  });
-  const { directories } = parse(browseResponse, response, 'INVALID_RESPONSE');
-  const needle = args.directoryContains?.toLowerCase() ?? '';
-  const items = directories
-    .filter((directory) => directory.name.toLowerCase().includes(needle))
-    .map((directory) => ({ directory: directory.name, fileCount: directory.fileCount }))
-    .sort((a, b) => compareText(a.directory, b.directory));
-  return { username: args.username, ...page(items, args.offset, args.limit) };
-}
-
 function fullFilename(directory: string, basename: string) {
   // Match the dashboard's separator preference, with the Soulseek default for root names.
   // Never use path.join/resolve: these are peer-supplied paths, not local filesystem paths.
@@ -136,82 +117,95 @@ function fullFilename(directory: string, basename: string) {
   return `${directory}${directory.endsWith(separator) ? '' : separator}${basename}`;
 }
 
-export async function browseDirectory(
-  raw: unknown,
-  env: Environment = process.env,
-  signal?: AbortSignal,
-) {
-  const args = parse(browseDirectoryInput, raw, 'INVALID_ARGUMENT');
-  const response = await requestJson(readPeerConfig(env), `${userPath(args.username)}/directory`, {
-    method: 'POST',
-    readOnly: true,
-    body: { directory: args.directory },
-    signal,
-  });
-  const directories = parse(directoryResponse, response, 'INVALID_RESPONSE');
-  const matching = directories.filter((directory) => directory.name === args.directory);
-  if (directories.length && !matching.length) {
-    throw new SlskdError('INVALID_RESPONSE', 'slskd returned a different remote directory.');
+export function createPeerOperations(client: HttpClient) {
+  async function browseUser(raw: unknown, signal?: AbortSignal) {
+    const args = parse(browseUserInput, raw, 'INVALID_ARGUMENT');
+    const response = await client.requestPeer(`${userPath(args.username)}/browse`, {
+      signal,
+    });
+    const { directories } = parse(browseResponse, response, 'INVALID_RESPONSE');
+    const needle = args.directoryContains?.toLowerCase() ?? '';
+    const items = directories
+      .filter((directory) => directory.name.toLowerCase().includes(needle))
+      .map((directory) => ({ directory: directory.name, fileCount: directory.fileCount }))
+      .sort((a, b) => compareText(a.directory, b.directory));
+    return { username: args.username, ...page(items, args.offset, args.limit) };
   }
 
-  const files = new Map<string, FileRecord>();
-  for (const directory of matching) {
-    for (const file of directory.files) {
-      if (file.isLocked) {
-        continue;
-      }
-      const projected = projectFile(
-        { ...file, filename: fullFilename(directory.name, file.filename) },
-        args.username,
-      );
-      const identity = JSON.stringify([projected.filename, projected.sizeBytes]);
-      if (!files.has(identity)) {
-        files.set(identity, projected);
-      }
+  async function browseDirectory(raw: unknown, signal?: AbortSignal) {
+    const args = parse(browseDirectoryInput, raw, 'INVALID_ARGUMENT');
+    const response = await client.requestPeer(`${userPath(args.username)}/directory`, {
+      method: 'POST',
+      readOnly: true,
+      body: { directory: args.directory },
+      signal,
+    });
+    const directories = parse(directoryResponse, response, 'INVALID_RESPONSE');
+    const matching = directories.filter((directory) => directory.name === args.directory);
+    if (directories.length && !matching.length) {
+      throw new SlskdError('INVALID_RESPONSE', 'slskd returned a different remote directory.');
     }
-  }
-  const items = [...files.values()]
-    .filter((file) => matchesFilters(file, args.filters))
-    .sort((a, b) => compareText(a.filename, b.filename) || a.sizeBytes - b.sizeBytes);
-  return {
-    username: args.username,
-    directory: args.directory,
-    ...page(items, args.offset, args.limit),
-  };
-}
 
-export async function userInfo(raw: unknown, env: Environment = process.env, signal?: AbortSignal) {
-  const { username } = parse(userInfoInput, raw, 'INVALID_ARGUMENT');
-  const config = readPeerConfig(env);
-  const controller = new AbortController();
-  const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
-  try {
-    const [rawInfo, rawStatus] = await Promise.all([
-      requestJson(config, `${userPath(username)}/info`, { signal: combined }),
-      requestJson(config, `${userPath(username)}/status`, { signal: combined }),
-    ]);
-    const info = parse(infoResponse, rawInfo, 'INVALID_RESPONSE');
-    const status = parse(statusResponse, rawStatus, 'INVALID_RESPONSE');
-    const description: string[] | null = info.description == null ? null : [];
-    if (description !== null) {
-      for (const character of info.description!) {
-        description.push(character);
-        if (description.length > 2000) {
-          break;
+    const files = new Map<string, FileRecord>();
+    for (const directory of matching) {
+      for (const file of directory.files) {
+        if (file.isLocked) {
+          continue;
+        }
+        const projected = projectFile(
+          { ...file, filename: fullFilename(directory.name, file.filename) },
+          args.username,
+        );
+        const identity = JSON.stringify([projected.filename, projected.sizeBytes]);
+        if (!files.has(identity)) {
+          files.set(identity, projected);
         }
       }
     }
+    const items = [...files.values()]
+      .filter((file) => matchesFilters(file, args.filters))
+      .sort((a, b) => compareText(a.filename, b.filename) || a.sizeBytes - b.sizeBytes);
     return {
-      username,
-      status: status.presence ?? null,
-      description: description?.slice(0, 2000).join('') ?? null,
-      descriptionTruncated: description !== null && description.length > 2000,
-      uploadSlots: info.uploadSlots ?? null,
-      queueLength: info.queueLength ?? null,
-      hasFreeUploadSlot: info.hasFreeUploadSlot ?? null,
-      fetchedAt: new Date().toISOString(),
+      username: args.username,
+      directory: args.directory,
+      ...page(items, args.offset, args.limit),
     };
-  } finally {
-    controller.abort();
   }
+
+  async function userInfo(raw: unknown, signal?: AbortSignal) {
+    const { username } = parse(userInfoInput, raw, 'INVALID_ARGUMENT');
+    const controller = new AbortController();
+    const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+    try {
+      const [rawInfo, rawStatus] = await Promise.all([
+        client.requestPeer(`${userPath(username)}/info`, { signal: combined }),
+        client.requestPeer(`${userPath(username)}/status`, { signal: combined }),
+      ]);
+      const info = parse(infoResponse, rawInfo, 'INVALID_RESPONSE');
+      const status = parse(statusResponse, rawStatus, 'INVALID_RESPONSE');
+      const description: string[] | null = info.description == null ? null : [];
+      if (description !== null) {
+        for (const character of info.description!) {
+          description.push(character);
+          if (description.length > 2000) {
+            break;
+          }
+        }
+      }
+      return {
+        username,
+        status: status.presence ?? null,
+        description: description?.slice(0, 2000).join('') ?? null,
+        descriptionTruncated: description !== null && description.length > 2000,
+        uploadSlots: info.uploadSlots ?? null,
+        queueLength: info.queueLength ?? null,
+        hasFreeUploadSlot: info.hasFreeUploadSlot ?? null,
+        fetchedAt: new Date().toISOString(),
+      };
+    } finally {
+      controller.abort();
+    }
+  }
+
+  return { browseUser, browseDirectory, userInfo };
 }

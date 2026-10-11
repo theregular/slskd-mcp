@@ -3,21 +3,18 @@ import assert from 'node:assert/strict';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
+import { createSlskdClient } from '../src/client.js';
 import { fileURLToPath } from 'node:url';
 import { once } from 'node:events';
-import {
-  searchStart,
-  searchResults,
-  searchCompletion,
-  searchResultsOutput,
-} from '../src/search.js';
-import { requestJson, MAX_RESPONSE_BYTES } from '../src/client.js';
+import { searchCompletion, searchResultsOutput } from '../src/search.js';
+import { createHttpClient, MAX_RESPONSE_BYTES } from '../src/http.js';
 import { readConfig } from '../src/config.js';
 import { SlskdError, errorResult } from '../src/errors.js';
 
 const id = '550e8400-e29b-41d4-a716-446655440000';
 const key = 'test-key-never-echo';
 const envFor = (base: string) => ({ SLSKD_URL: base, SLSKD_API_KEY: key });
+const clientFor = (base: string) => createSlskdClient(readConfig(envFor(base)));
 const file = (filename = 'Music\\Album\\01 Écho.flac', extra = {}) => ({
   filename,
   size: 12345,
@@ -97,8 +94,8 @@ test('search starts once with milliseconds, prefix/auth and generated ID; later 
       }
     },
     async (base) => {
-      const env = envFor(base + '/prefix/');
-      const started = await searchStart({ query: ' Artist Track ' }, env);
+      const slskd = clientFor(base + '/prefix/');
+      const started = await slskd.searchStart({ query: ' Artist Track ' });
       assert.equal(started.isComplete, false);
       assert.equal(started.searchTimeoutSeconds, 15);
       assert.deepEqual(submitted, {
@@ -108,8 +105,8 @@ test('search starts once with milliseconds, prefix/auth and generated ID; later 
         fileLimit: 10000,
         responseLimit: 100,
       });
-      assert.equal((await searchResults({ searchId: started.searchId }, env)).matchedCount, 0);
-      const result = await searchResults({ searchId: started.searchId }, env);
+      assert.equal((await slskd.searchResults({ searchId: started.searchId })).matchedCount, 0);
+      const result = await slskd.searchResults({ searchId: started.searchId });
       assert.equal(result.matchedCount, 1);
       assert.equal(result.items[0]?.sampleRateHz, 44100);
       assert.equal(result.items[0]?.freeUploadSlots, true);
@@ -129,6 +126,8 @@ test('validates strict inputs and credentials before any network operation', asy
       json(res, {});
     },
     async (base) => {
+      const slskd = clientFor(base);
+
       for (const args of [
         { query: ' ' },
         { query: 'x', fileLimit: 0 },
@@ -137,7 +136,7 @@ test('validates strict inputs and credentials before any network operation', asy
         { query: 'x', url: base },
         { query: 'a'.repeat(501) },
       ]) {
-        await assert.rejects(searchStart(args, envFor(base)), { code: 'INVALID_ARGUMENT' });
+        await assert.rejects(slskd.searchStart(args), { code: 'INVALID_ARGUMENT' });
       }
       for (const args of [
         { searchId: '../server' },
@@ -146,11 +145,14 @@ test('validates strict inputs and credentials before any network operation', asy
         { searchId: id, filters: { regex: 'x' } },
         { searchId: id, filters: { minBitRateKbps: -1 } },
       ]) {
-        await assert.rejects(searchResults(args, envFor(base)), { code: 'INVALID_ARGUMENT' });
+        await assert.rejects(slskd.searchResults(args), { code: 'INVALID_ARGUMENT' });
       }
-      await assert.rejects(searchStart({ query: 'x' }, { SLSKD_URL: base }), {
-        code: 'AUTH_NOT_CONFIGURED',
-      });
+      await assert.rejects(
+        createSlskdClient(readConfig({ SLSKD_URL: base })).searchStart({ query: 'x' }),
+        {
+          code: 'AUTH_NOT_CONFIGURED',
+        },
+      );
       assert.equal(calls, 0);
     },
   );
@@ -167,7 +169,9 @@ test('distinguishes empty running, terminal, unknown future states and missing I
     await fixture(
       (_req, res) => json(res, search({ state })),
       async (base) => {
-        const result = await searchResults({ searchId: id }, envFor(base));
+        const slskd = clientFor(base);
+
+        const result = await slskd.searchResults({ searchId: id });
         assert.equal(result.isComplete, expected);
         assert.deepEqual(result.items, []);
       },
@@ -180,7 +184,9 @@ test('distinguishes empty running, terminal, unknown future states and missing I
       res.end(key);
     },
     async (base) => {
-      await assert.rejects(searchResults({ searchId: id }, envFor(base)), { code: 'NOT_FOUND' });
+      const slskd = clientFor(base);
+
+      await assert.rejects(slskd.searchResults({ searchId: id }), { code: 'NOT_FOUND' });
     },
   );
 });
@@ -195,19 +201,18 @@ test('filters combine literal include/exclude/extension/bitrate and preserve dif
   await fixture(
     (_req, res) => json(res, search({ responses })),
     async (base) => {
-      const result = await searchResults(
-        {
-          searchId: id,
-          filters: {
-            extensions: ['.mp3'],
-            minBitRateKbps: 320,
-            include: ['ARTIST', '[live]'],
-            exclude: ['REMIX'],
-          },
-          sort: 'bitrate',
+      const slskd = clientFor(base);
+
+      const result = await slskd.searchResults({
+        searchId: id,
+        filters: {
+          extensions: ['.mp3'],
+          minBitRateKbps: 320,
+          include: ['ARTIST', '[live]'],
+          exclude: ['REMIX'],
         },
-        envFor(base),
-      );
+        sort: 'bitrate',
+      });
       assert.equal(result.receivedFileCount, 6);
       assert.equal(result.matchedCount, 2);
       assert.deepEqual(
@@ -215,15 +220,12 @@ test('filters combine literal include/exclude/extension/bitrate and preserve dif
         ['a', 'b'],
       );
       assert.equal(searchResultsOutput.safeParse(result).success, true);
-      const empty = await searchResults(
-        { searchId: id, filters: { include: ['.*'] } },
-        envFor(base),
-      );
+      const empty = await slskd.searchResults({ searchId: id, filters: { include: ['.*'] } });
       assert.equal(empty.matchedCount, 0);
-      const all = await searchResults(
-        { searchId: id, filters: { extensions: [], include: [], exclude: [] } },
-        envFor(base),
-      );
+      const all = await slskd.searchResults({
+        searchId: id,
+        filters: { extensions: [], include: [], exclude: [] },
+      });
       assert.equal(all.matchedCount, 5);
     },
   );
@@ -240,17 +242,19 @@ test('sorts availability, bitrate nulls and filename with exact deterministic ti
   await fixture(
     (_req, res) => json(res, search({ responses })),
     async (base) => {
-      const env = envFor(base);
+      const slskd = clientFor(base);
       assert.deepEqual(
-        (await searchResults({ searchId: id }, env)).items.map((f) => f.username),
+        (await slskd.searchResults({ searchId: id })).items.map((f) => f.username),
         ['fast', 'slow', 'queued', 'busy', 'unknown'],
       );
       assert.deepEqual(
-        (await searchResults({ searchId: id, sort: 'bitrate' }, env)).items.map((f) => f.username),
+        (await slskd.searchResults({ searchId: id, sort: 'bitrate' })).items.map((f) => f.username),
         ['busy', 'slow', 'fast', 'queued', 'unknown'],
       );
       assert.deepEqual(
-        (await searchResults({ searchId: id, sort: 'filename' }, env)).items.map((f) => f.filename),
+        (await slskd.searchResults({ searchId: id, sort: 'filename' })).items.map(
+          (f) => f.filename,
+        ),
         ['A', 'B', 'C', 'Y', 'Z'],
       );
     },
@@ -280,27 +284,24 @@ test('deduplicates first identity only and pages after filtering, omitting locke
         }),
       ),
     async (base) => {
-      const result = await searchResults(
-        { searchId: id, sort: 'filename', offset: 25, limit: 3 },
-        envFor(base),
-      );
+      const slskd = clientFor(base);
+
+      const result = await slskd.searchResults({
+        searchId: id,
+        sort: 'filename',
+        offset: 25,
+        limit: 3,
+      });
       assert.equal(result.items.length, 3);
       assert.equal(result.items[0]?.filename, 'Track 25.flac');
       assert.equal(result.matchedCount, 30);
       assert.equal(result.receivedFileCount, 32);
       assert.equal(result.hasMore, true);
       assert.equal(result.consistency, 'live');
+      assert.equal((await slskd.searchResults({ searchId: id, offset: 100 })).hasMore, false);
+      assert.deepEqual((await slskd.searchResults({ searchId: id, offset: 100 })).items, []);
       assert.equal(
-        (await searchResults({ searchId: id, offset: 100 }, envFor(base))).hasMore,
-        false,
-      );
-      assert.deepEqual(
-        (await searchResults({ searchId: id, offset: 100 }, envFor(base))).items,
-        [],
-      );
-      assert.equal(
-        (await searchResults({ searchId: id, sort: 'filename' }, envFor(base))).items[0]
-          ?.bitRateKbps,
+        (await slskd.searchResults({ searchId: id, sort: 'filename' })).items[0]?.bitRateKbps,
         null,
       );
     },
@@ -320,7 +321,9 @@ test('rejects invalid JSON, schema, unsafe file sizes, negative metadata and wro
         res.end(payload);
       },
       async (base) => {
-        await assert.rejects(searchResults({ searchId: id }, envFor(base)), {
+        const slskd = clientFor(base);
+
+        await assert.rejects(slskd.searchResults({ searchId: id }), {
           code: 'INVALID_RESPONSE',
         });
       },
@@ -345,7 +348,9 @@ for (const [status, code] of [
         res.end(key);
       },
       async (base) => {
-        await assert.rejects(searchResults({ searchId: id }, envFor(base)), (error: unknown) => {
+        const slskd = clientFor(base);
+
+        await assert.rejects(slskd.searchResults({ searchId: id }), (error: unknown) => {
           assert(error instanceof SlskdError);
           assert.equal(error.code, code);
           assert(!JSON.stringify(errorResult(error)).includes(key));
@@ -366,12 +371,16 @@ test('reads time out through body consumption and honor caller cancellation', as
       res.write('{');
     },
     async (base) => {
+      const slskd = clientFor(base);
+
       await assert.rejects(
-        searchResults({ searchId: id }, { ...envFor(base), SLSKD_TIMEOUT_MS: '100' }),
+        createSlskdClient(readConfig({ ...envFor(base), SLSKD_TIMEOUT_MS: '100' })).searchResults({
+          searchId: id,
+        }),
         { code: 'TIMEOUT' },
       );
       const abort = new AbortController();
-      const pending = searchResults({ searchId: id }, envFor(base), abort.signal);
+      const pending = slskd.searchResults({ searchId: id }, abort.signal);
       abort.abort();
       await assert.rejects(pending, { code: 'CANCELLED' });
     },
@@ -386,8 +395,10 @@ test('cancelled before dispatch sends nothing, including writes', async () => {
       json(res, {});
     },
     async (base) => {
+      const slskd = clientFor(base);
+
       const signal = AbortSignal.abort();
-      await assert.rejects(searchStart({ query: 'track' }, envFor(base), signal), {
+      await assert.rejects(slskd.searchStart({ query: 'track' }, signal), {
         code: 'CANCELLED',
       });
       assert.equal(calls, 0);
@@ -414,7 +425,9 @@ test('response limits cover both Content-Length and a chunked body without it', 
         }
       },
       async (base) => {
-        await assert.rejects(searchResults({ searchId: id }, envFor(base)), {
+        const slskd = clientFor(base);
+
+        await assert.rejects(slskd.searchResults({ searchId: id }), {
           code: 'RESPONSE_TOO_LARGE',
         });
       },
@@ -448,7 +461,9 @@ test('writes never retry after lost response, timeout, malformed success or serv
       },
       async (base) => {
         await assert.rejects(
-          searchStart({ query: 'track' }, { ...envFor(base), SLSKD_TIMEOUT_MS: '100' }),
+          createSlskdClient(readConfig({ ...envFor(base), SLSKD_TIMEOUT_MS: '100' })).searchStart({
+            query: 'track',
+          }),
           (error: unknown) => {
             assert(error instanceof SlskdError);
             assert.equal(error.code, 'OUTCOME_UNKNOWN');
@@ -478,7 +493,9 @@ test('known write rejections stay definite; redirects never carry credentials to
         res.end(key);
       },
       async (base) => {
-        await assert.rejects(searchStart({ query: 'track' }, envFor(base)), { code });
+        const slskd = clientFor(base);
+
+        await assert.rejects(slskd.searchStart({ query: 'track' }), { code });
         assert.equal(calls, 1);
       },
     );
@@ -496,10 +513,12 @@ test('known write rejections stay definite; redirects never carry credentials to
           res.end();
         },
         async (base) => {
-          await assert.rejects(searchResults({ searchId: id }, envFor(base)), {
+          const slskd = clientFor(base);
+
+          await assert.rejects(slskd.searchResults({ searchId: id }), {
             code: 'UNREACHABLE',
           });
-          await assert.rejects(searchStart({ query: 'track' }, envFor(base)), {
+          await assert.rejects(slskd.searchStart({ query: 'track' }), {
             code: 'OUTCOME_UNKNOWN',
           });
           assert.equal(reached, false);
@@ -519,7 +538,9 @@ test('new client preserves bearer authentication and ignores malformed retry hin
     },
     async (base) => {
       await assert.rejects(
-        requestJson(readConfig({ SLSKD_URL: base, SLSKD_BEARER_TOKEN: key }), '/searches'),
+        createHttpClient(readConfig({ SLSKD_URL: base, SLSKD_BEARER_TOKEN: key })).request(
+          '/searches',
+        ),
         (error: unknown) => {
           assert(error instanceof SlskdError);
           assert.deepEqual(error.details, {});

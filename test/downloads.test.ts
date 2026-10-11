@@ -5,15 +5,12 @@ import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
+import { createSlskdClient } from '../src/client.js';
+import { readConfig } from '../src/config.js';
 import {
-  downloadQueue,
   downloadQueueOutput,
-  downloadList,
   downloadListOutput,
-  downloadStatus,
   downloadStatusOutput,
-  downloadCancel,
-  downloadClearCompleted,
   transferCompletion,
 } from '../src/downloads.js';
 import { SlskdError, errorResult } from '../src/errors.js';
@@ -28,6 +25,7 @@ const envFor = (base: string) => ({
   SLSKD_URL: base,
   SLSKD_API_KEY: key,
 });
+const clientFor = (base: string) => createSlskdClient(readConfig(envFor(base)));
 const transfer = (extra = {}) => ({
   id,
   batchId,
@@ -160,7 +158,7 @@ test('enqueue sends only exact requested identities, batch/search IDs and preser
     },
     async (base) => {
       const result = downloadQueueOutput.parse(
-        await downloadQueue({ ...queueArgs(), searchId: otherId }, envFor(base + '/prefix/')),
+        await clientFor(base + '/prefix/').downloadQueue({ ...queueArgs(), searchId: otherId }),
       );
       assert.deepEqual(result.accepted, [{ filename, sizeBytes: 100, transferId: id }]);
       assert.equal(result.outcome, 'accepted');
@@ -179,16 +177,16 @@ test('malformed paths, duplicate names, sizes, selectors and unsupported options
       res.end();
     },
     async (base) => {
-      const env = envFor(base);
+      const slskd = clientFor(base);
       for (const path of ['', '  ', 'a\0b', 'a/../b', 'a\\..\\b', '../b', '..\\b']) {
         await assert.rejects(
-          downloadQueue({ ...queueArgs(), files: [{ filename: path, sizeBytes: 1 }] }, env),
+          slskd.downloadQueue({ ...queueArgs(), files: [{ filename: path, sizeBytes: 1 }] }),
           { code: 'INVALID_ARGUMENT' },
         );
       }
       for (const sizeBytes of [-1, 1.5, 9007199254740992]) {
         await assert.rejects(
-          downloadQueue({ ...queueArgs(), files: [{ filename, sizeBytes }] }, env),
+          slskd.downloadQueue({ ...queueArgs(), files: [{ filename, sizeBytes }] }),
           { code: 'INVALID_ARGUMENT' },
         );
       }
@@ -204,7 +202,7 @@ test('malformed paths, duplicate names, sizes, selectors and unsupported options
         { ...queueArgs(), username: 'a\0b' },
         { ...queueArgs(), requestId: '00000000-0000-0000-0000-000000000000' },
       ]) {
-        await assert.rejects(downloadQueue(args, env), { code: 'INVALID_ARGUMENT' });
+        await assert.rejects(slskd.downloadQueue(args), { code: 'INVALID_ARGUMENT' });
       }
       for (const args of [
         {},
@@ -213,13 +211,15 @@ test('malformed paths, duplicate names, sizes, selectors and unsupported options
         { username, transferId: id, limit: 1 },
         { batchId, limit: 101 },
       ]) {
-        await assert.rejects(downloadStatus(args, env), { code: 'INVALID_ARGUMENT' });
+        await assert.rejects(slskd.downloadStatus(args), { code: 'INVALID_ARGUMENT' });
       }
-      await assert.rejects(downloadCancel({ username, transferId: id, remove: 'true' }, env), {
+      await assert.rejects(slskd.downloadCancel({ username, transferId: id, remove: 'true' }), {
         code: 'INVALID_ARGUMENT',
       });
-      await assert.rejects(downloadClearCompleted({ username }, env), { code: 'INVALID_ARGUMENT' });
-      await assert.rejects(downloadQueue(queueArgs(), env, AbortSignal.abort()), {
+      await assert.rejects(slskd.downloadClearCompleted({ username }), {
+        code: 'INVALID_ARGUMENT',
+      });
+      await assert.rejects(slskd.downloadQueue(queueArgs(), AbortSignal.abort()), {
         code: 'CANCELLED',
       });
       assert.equal(calls, 0);
@@ -251,7 +251,9 @@ test('batch counts derive from per-file outcomes, including failure records and 
           status,
         ),
       async (base) => {
-        const result = await downloadQueue({ ...queueArgs(), files }, envFor(base));
+        const slskd = clientFor(base);
+
+        const result = await slskd.downloadQueue({ ...queueArgs(), files });
         assert.equal(result.acceptedCount, 2 - failedCount!);
         assert.equal(result.failedCount, failedCount);
         assert.equal(
@@ -286,7 +288,9 @@ test('untrusted/mismatched successful enqueue bodies become ID-bearing uncertain
         json(res, response, 201);
       },
       async (base) => {
-        await assert.rejects(downloadQueue(queueArgs(), envFor(base)), (error: unknown) => {
+        const slskd = clientFor(base);
+
+        await assert.rejects(slskd.downloadQueue(queueArgs()), (error: unknown) => {
           assert(error instanceof SlskdError);
           assert.equal(error.code, 'OUTCOME_UNKNOWN');
           assert.equal(error.details.operationId, batchId);
@@ -322,12 +326,12 @@ test('enqueue never retries lost responses or timeout and can reconcile a genera
         }
       },
       async (base) => {
+        const slskd = clientFor(base);
+
         await assert.rejects(
-          downloadQueue(
-            { username, files: queueArgs().files },
-            { ...envFor(base), SLSKD_PEER_TIMEOUT_MS: '100' },
-            abort.signal,
-          ),
+          createSlskdClient(
+            readConfig({ ...envFor(base), SLSKD_PEER_TIMEOUT_MS: '100' }),
+          ).downloadQueue({ username, files: queueArgs().files }, abort.signal),
           (error: unknown) => {
             assert(error instanceof SlskdError);
             assert.equal(error.code, 'OUTCOME_UNKNOWN');
@@ -336,7 +340,7 @@ test('enqueue never retries lost responses or timeout and can reconcile a genera
             return true;
           },
         );
-        const result = await downloadStatus({ batchId: savedId }, envFor(base));
+        const result = await slskd.downloadStatus({ batchId: savedId });
         assert.equal(result.kind, 'batch');
         assert.equal(calls, 1);
       },
@@ -361,7 +365,9 @@ test('enqueue known rejections include duplicate ID conflicts and never retry', 
         res.end(key);
       },
       async (base) => {
-        await assert.rejects(downloadQueue(queueArgs(), envFor(base)), (error: unknown) => {
+        const slskd = clientFor(base);
+
+        await assert.rejects(slskd.downloadQueue(queueArgs()), (error: unknown) => {
           assert(error instanceof SlskdError);
           assert.equal(error.code, code);
           assert(!error.message.includes(key));
@@ -418,20 +424,20 @@ test('grouped downloads flatten, filter and page by ID without exposing local pa
       ]);
     },
     async (base) => {
-      const env = envFor(base);
-      const result = downloadListOutput.parse(await downloadList({}, env));
+      const slskd = clientFor(base);
+      const result = downloadListOutput.parse(await slskd.downloadList({}));
       assert.equal(result.matchedCount, 1);
       assert.equal(result.items[0]?.percentComplete, 0);
       assert.equal(result.items[0]?.averageSpeedBytesPerSecond, 12.5);
       assert(!JSON.stringify(result).includes(key));
-      const all = await downloadList({ includeRemoved: true, limit: 1, offset: 1 }, env);
+      const all = await slskd.downloadList({ includeRemoved: true, limit: 1, offset: 1 });
       assert.equal(all.matchedCount, 2);
       assert.equal(all.items[0]?.transferId, otherId);
       assert.equal(all.items[0]?.removed, true);
-      assert.equal((await downloadList({ username: 'different' }, env)).matchedCount, 0);
-      assert.equal((await downloadList({ states: ['inprogress'] }, env)).matchedCount, 0);
-      assert.equal((await downloadList({ states: ['InProgress'] }, env)).matchedCount, 1);
-      assert.deepEqual((await downloadList({ offset: 100 }, env)).items, []);
+      assert.equal((await slskd.downloadList({ username: 'different' })).matchedCount, 0);
+      assert.equal((await slskd.downloadList({ states: ['inprogress'] })).matchedCount, 0);
+      assert.equal((await slskd.downloadList({ states: ['InProgress'] })).matchedCount, 1);
+      assert.deepEqual((await slskd.downloadList({ offset: 100 })).items, []);
     },
   );
 });
@@ -449,16 +455,14 @@ test('batch status uses full verified associations, includes removed records exp
       );
     },
     async (base) => {
-      const result = downloadStatusOutput.parse(
-        await downloadStatus({ batchId, limit: 1 }, envFor(base)),
-      );
+      const slskd = clientFor(base);
+
+      const result = downloadStatusOutput.parse(await slskd.downloadStatus({ batchId, limit: 1 }));
       assert.equal(result.kind, 'batch');
       assert.equal(result.items?.[0]?.transferId, id);
       assert.equal(result.items?.[0]?.isComplete, null);
       assert.equal(result.hasMore, true);
-      const next = downloadStatusOutput.parse(
-        await downloadStatus({ batchId, offset: 1 }, envFor(base)),
-      );
+      const next = downloadStatusOutput.parse(await slskd.downloadStatus({ batchId, offset: 1 }));
       assert.equal(next.items?.[0]?.available, false);
       assert.equal(next.items?.[0]?.transferId, otherId);
     },
@@ -473,7 +477,9 @@ test('batch status uses full verified associations, includes removed records exp
     await fixture(
       (_req, res) => json(res, value),
       async (base) => {
-        await assert.rejects(downloadStatus({ batchId }, envFor(base)), {
+        const slskd = clientFor(base);
+
+        await assert.rejects(slskd.downloadStatus({ batchId }), {
           code: 'INVALID_RESPONSE',
         });
       },
@@ -490,8 +496,10 @@ test('single status and cancel check both username and ID; missing/mismatched id
         json(res, transfer(wrong));
       },
       async (base) => {
-        for (const fn of [downloadStatus, downloadCancel]) {
-          await assert.rejects(fn({ username, transferId: id }, envFor(base)), {
+        const slskd = clientFor(base);
+
+        for (const fn of ['downloadStatus', 'downloadCancel'] as const) {
+          await assert.rejects(slskd[fn]({ username, transferId: id }), {
             code: 'INVALID_ARGUMENT',
           });
         }
@@ -506,7 +514,9 @@ test('single status and cancel check both username and ID; missing/mismatched id
       res.end(key);
     },
     async (base) => {
-      await assert.rejects(downloadCancel({ username, transferId: id }, envFor(base)), {
+      const slskd = clientFor(base);
+
+      await assert.rejects(slskd.downloadCancel({ username, transferId: id }), {
         code: 'NOT_FOUND',
       });
     },
@@ -530,10 +540,11 @@ test('cancel acknowledges exact selected identity with default remove=false and 
         }
       },
       async (base) => {
-        const result = await downloadCancel(
-          { username, transferId: id, ...(remove === undefined ? {} : { remove }) },
-          envFor(base + '/prefix'),
-        );
+        const result = await clientFor(base + '/prefix').downloadCancel({
+          username,
+          transferId: id,
+          ...(remove === undefined ? {} : { remove }),
+        });
         assert.deepEqual(result, {
           username,
           transferId: id,
@@ -568,13 +579,11 @@ test('cancel handles preflight races, cancellation and ambiguous DELETE without 
         }
       },
       async (base) => {
-        await assert.rejects(
-          downloadCancel({ username, transferId: id }, envFor(base), abort.signal),
-          {
-            code:
-              mode === 'gone' ? 'NOT_FOUND' : mode === 'cancel' ? 'CANCELLED' : 'OUTCOME_UNKNOWN',
-          },
-        );
+        const slskd = clientFor(base);
+
+        await assert.rejects(slskd.downloadCancel({ username, transferId: id }, abort.signal), {
+          code: mode === 'gone' ? 'NOT_FOUND' : mode === 'cancel' ? 'CANCELLED' : 'OUTCOME_UNKNOWN',
+        });
         assert.equal(deletes, mode === 'cancel' ? 0 : 1);
       },
     );
@@ -592,7 +601,9 @@ test('cleanup calls global terminal-history endpoint once without claiming count
       res.end();
     },
     async (base) => {
-      assert.deepEqual(await downloadClearCompleted({}, envFor(base)), {
+      const slskd = clientFor(base);
+
+      assert.deepEqual(await slskd.downloadClearCompleted({}), {
         cleared: true,
         scope: 'all_completed',
       });

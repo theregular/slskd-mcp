@@ -1,19 +1,14 @@
 import { McpServer } from '@modelcontextprotocol/server';
 import { z } from 'zod';
-import { connectionStatus, StatusError, type Environment } from './status.js';
+import { type SlskdClient } from './client.js';
 
-import { errorResult, jsonResult } from './errors.js';
+import { SlskdError, errorResult, jsonResult } from './errors.js';
 import {
-  searchList,
-  searchStop,
-  searchDelete,
   searchListInput,
   searchIdInput,
   searchListOutput,
   searchStopOutput,
   searchDeleteOutput,
-  searchStart,
-  searchResults,
   searchStartInput,
   searchResultsInput,
   searchStartOutput,
@@ -21,9 +16,6 @@ import {
 } from './search.js';
 
 import {
-  browseUser,
-  browseDirectory,
-  userInfo,
   browseUserInput,
   browseDirectoryInput,
   userInfoInput,
@@ -33,26 +25,19 @@ import {
 } from './peers.js';
 
 import {
-  downloadQueue,
   downloadQueueInput,
   downloadQueueOutput,
-  downloadList,
   downloadListInput,
   downloadListOutput,
-  downloadStatus,
   downloadStatusInput,
   downloadStatusOutput,
-  downloadCancel,
   downloadCancelInput,
   downloadCancelOutput,
-  downloadClearCompleted,
   downloadClearInput,
   downloadClearOutput,
 } from './downloads.js';
 
-export function createServer(env: Environment = process.env) {
-  // Snapshot capability configuration; changing the environment requires a new server.
-  env = { ...env };
+export function createServer(slskd: SlskdClient) {
   const server = new McpServer({ name: 'slskd-mcp', version: '0.1.0' });
 
   server.registerTool(
@@ -71,7 +56,7 @@ export function createServer(env: Environment = process.env) {
     },
     async () => {
       try {
-        const result = await connectionStatus(env);
+        const result = await slskd.connectionStatus();
         return {
           content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }],
           structuredContent: result,
@@ -79,7 +64,7 @@ export function createServer(env: Environment = process.env) {
       } catch (error) {
         // Never echo HTTP response bodies or credentials into tool output.
         const result =
-          error instanceof StatusError
+          error instanceof SlskdError
             ? { code: error.code, message: error.message }
             : { code: 'INTERNAL_ERROR', message: 'Unexpected error while checking slskd.' };
         return {
@@ -108,7 +93,7 @@ export function createServer(env: Environment = process.env) {
     },
     async (args, ctx) => {
       try {
-        return jsonResult(await searchStart(args, env, ctx.mcpReq.signal));
+        return jsonResult(await slskd.searchStart(args, ctx.mcpReq.signal));
       } catch (error) {
         return { ...jsonResult(errorResult(error)), isError: true };
       }
@@ -132,7 +117,7 @@ export function createServer(env: Environment = process.env) {
     },
     async (args, ctx) => {
       try {
-        return jsonResult(await searchResults(args, env, ctx.mcpReq.signal));
+        return jsonResult(await slskd.searchResults(args, ctx.mcpReq.signal));
       } catch (error) {
         return { ...jsonResult(errorResult(error)), isError: true };
       }
@@ -156,7 +141,7 @@ export function createServer(env: Environment = process.env) {
     },
     async (args, ctx) => {
       try {
-        return jsonResult(await searchList(args, env, ctx.mcpReq.signal));
+        return jsonResult(await slskd.searchList(args, ctx.mcpReq.signal));
       } catch (error) {
         return { ...jsonResult(errorResult(error)), isError: true };
       }
@@ -180,7 +165,7 @@ export function createServer(env: Environment = process.env) {
     },
     async (args, ctx) => {
       try {
-        return jsonResult(await searchStop(args, env, ctx.mcpReq.signal));
+        return jsonResult(await slskd.searchStop(args, ctx.mcpReq.signal));
       } catch (error) {
         return { ...jsonResult(errorResult(error)), isError: true };
       }
@@ -204,7 +189,7 @@ export function createServer(env: Environment = process.env) {
     },
     async (args, ctx) => {
       try {
-        return jsonResult(await searchDelete(args, env, ctx.mcpReq.signal));
+        return jsonResult(await slskd.searchDelete(args, ctx.mcpReq.signal));
       } catch (error) {
         return { ...jsonResult(errorResult(error)), isError: true };
       }
@@ -228,7 +213,7 @@ export function createServer(env: Environment = process.env) {
     },
     async (args, ctx) => {
       try {
-        return jsonResult(await browseUser(args, env, ctx.mcpReq.signal));
+        return jsonResult(await slskd.browseUser(args, ctx.mcpReq.signal));
       } catch (error) {
         return { ...jsonResult(errorResult(error)), isError: true };
       }
@@ -252,7 +237,7 @@ export function createServer(env: Environment = process.env) {
     },
     async (args, ctx) => {
       try {
-        return jsonResult(await browseDirectory(args, env, ctx.mcpReq.signal));
+        return jsonResult(await slskd.browseDirectory(args, ctx.mcpReq.signal));
       } catch (error) {
         return { ...jsonResult(errorResult(error)), isError: true };
       }
@@ -276,7 +261,7 @@ export function createServer(env: Environment = process.env) {
     },
     async (args, ctx) => {
       try {
-        return jsonResult(await userInfo(args, env, ctx.mcpReq.signal));
+        return jsonResult(await slskd.userInfo(args, ctx.mcpReq.signal));
       } catch (error) {
         return { ...jsonResult(errorResult(error)), isError: true };
       }
@@ -300,7 +285,7 @@ export function createServer(env: Environment = process.env) {
     },
     async (args, ctx) => {
       try {
-        const result = await downloadQueue(args, env, ctx.mcpReq.signal);
+        const result = await slskd.downloadQueue(args, ctx.mcpReq.signal);
         if (result.outcome === 'rejected') {
           return { ...jsonResult(result), isError: true };
         }
@@ -328,7 +313,7 @@ export function createServer(env: Environment = process.env) {
     },
     async (args, ctx) => {
       try {
-        const result = await downloadList(args, env, ctx.mcpReq.signal);
+        const result = await slskd.downloadList(args, ctx.mcpReq.signal);
         return jsonResult(result);
       } catch (error) {
         return { ...jsonResult(errorResult(error)), isError: true };
@@ -353,7 +338,7 @@ export function createServer(env: Environment = process.env) {
     },
     async (args, ctx) => {
       try {
-        const result = await downloadStatus(args, env, ctx.mcpReq.signal);
+        const result = await slskd.downloadStatus(args, ctx.mcpReq.signal);
         return jsonResult(result);
       } catch (error) {
         return { ...jsonResult(errorResult(error)), isError: true };
@@ -378,7 +363,7 @@ export function createServer(env: Environment = process.env) {
     },
     async (args, ctx) => {
       try {
-        const result = await downloadCancel(args, env, ctx.mcpReq.signal);
+        const result = await slskd.downloadCancel(args, ctx.mcpReq.signal);
         return jsonResult(result);
       } catch (error) {
         return { ...jsonResult(errorResult(error)), isError: true };
@@ -403,7 +388,7 @@ export function createServer(env: Environment = process.env) {
     },
     async (args, ctx) => {
       try {
-        const result = await downloadClearCompleted(args, env, ctx.mcpReq.signal);
+        const result = await slskd.downloadClearCompleted(args, ctx.mcpReq.signal);
         return jsonResult(result);
       } catch (error) {
         return { ...jsonResult(errorResult(error)), isError: true };

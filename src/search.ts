@@ -1,7 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { readConfig, type Environment } from './config.js';
-import { requestJson } from './client.js';
+import { type HttpClient } from './http.js';
 import { SlskdError, unknownOutcome } from './errors.js';
 import {
   compareNullable,
@@ -125,40 +124,6 @@ function input<T>(schema: z.ZodType<T>, raw: unknown): T {
   return parsed.data;
 }
 
-export async function searchStart(
-  raw: unknown,
-  env: Environment = process.env,
-  signal?: AbortSignal,
-) {
-  const args = input(searchStartInput, raw);
-  const config = readConfig(env);
-  const id = randomUUID();
-  const response = await requestJson(config, '/searches', {
-    method: 'POST',
-    operationId: id,
-    signal,
-    body: {
-      id,
-      searchText: args.query,
-      // slskd's DTO comment says seconds, but ToSearchOptions passes this straight to milliseconds.
-      searchTimeout: args.searchTimeoutSeconds * 1000,
-      fileLimit: args.fileLimit,
-      responseLimit: args.responseLimit,
-    },
-  });
-  const parsed = upstreamSummary.safeParse(response);
-  if (!parsed.success || parsed.data.id.toLowerCase() !== id.toLowerCase()) {
-    throw unknownOutcome(id);
-  }
-
-  return {
-    ...summary(parsed.data),
-    searchTimeoutSeconds: args.searchTimeoutSeconds,
-    fileLimit: args.fileLimit,
-    responseLimit: args.responseLimit,
-  };
-}
-
 function order(a: SearchFile, b: SearchFile, sort: z.infer<typeof searchResultsInput>['sort']) {
   let primary: number;
   if (sort === 'availability') {
@@ -181,51 +146,6 @@ function order(a: SearchFile, b: SearchFile, sort: z.infer<typeof searchResultsI
     compareText(a.filename, b.filename) ||
     a.sizeBytes - b.sizeBytes
   );
-}
-
-export async function searchResults(
-  raw: unknown,
-  env: Environment = process.env,
-  signal?: AbortSignal,
-) {
-  const args = input(searchResultsInput, raw);
-  const response = await requestJson(
-    readConfig(env),
-    `/searches/${args.searchId}?includeResponses=true`,
-    { signal },
-  );
-  const parsed = upstreamSearch.safeParse(response);
-  if (!parsed.success || parsed.data.id.toLowerCase() !== args.searchId.toLowerCase()) {
-    throw new SlskdError(
-      'INVALID_RESPONSE',
-      'slskd returned an unexpected search response shape or identity.',
-    );
-  }
-
-  const files = new Map<string, SearchFile>();
-  let receivedFileCount = 0;
-  for (const peer of parsed.data.responses) {
-    for (const file of peer.files) {
-      receivedFileCount++;
-      // Locked results cannot be treated as ordinary selectable downloads.
-      if (file.isLocked) {
-        continue;
-      }
-      const identity = JSON.stringify([peer.username, file.filename, file.size]);
-      if (!files.has(identity)) {
-        files.set(identity, {
-          ...projectFile(file, peer.username),
-          freeUploadSlots: peer.hasFreeUploadSlot ?? null,
-          queueLength: peer.queueLength ?? null,
-          uploadSpeedBytesPerSecond: peer.uploadSpeed ?? null,
-        });
-      }
-    }
-  }
-
-  const matched = [...files.values()].filter((file) => matchesFilters(file, args.filters));
-  matched.sort((a, b) => order(a, b, args.sort));
-  return { ...summary(parsed.data), receivedFileCount, ...page(matched, args.offset, args.limit) };
 }
 
 export const searchListInput = z
@@ -254,52 +174,116 @@ export const searchDeleteOutput = z.object({
   deleted: z.literal(true),
 });
 
-export async function searchList(
-  raw: unknown,
-  env: Environment = process.env,
-  signal?: AbortSignal,
-) {
-  const args = input(searchListInput, raw);
-  const response = await requestJson(readConfig(env), '/searches', { signal });
-  const parsed = z.array(upstreamSummary).safeParse(response);
-  if (!parsed.success) {
-    throw new SlskdError('INVALID_RESPONSE', 'slskd returned an unexpected search list shape.');
+export function createSearchOperations(client: HttpClient) {
+  async function searchStart(raw: unknown, signal?: AbortSignal) {
+    const args = input(searchStartInput, raw);
+    const id = randomUUID();
+    const response = await client.request('/searches', {
+      method: 'POST',
+      operationId: id,
+      signal,
+      body: {
+        id,
+        searchText: args.query,
+        // slskd's DTO comment says seconds, but ToSearchOptions passes this straight to milliseconds.
+        searchTimeout: args.searchTimeoutSeconds * 1000,
+        fileLimit: args.fileLimit,
+        responseLimit: args.responseLimit,
+      },
+    });
+    const parsed = upstreamSummary.safeParse(response);
+    if (!parsed.success || parsed.data.id.toLowerCase() !== id.toLowerCase()) {
+      throw unknownOutcome(id);
+    }
+
+    return {
+      ...summary(parsed.data),
+      searchTimeoutSeconds: args.searchTimeoutSeconds,
+      fileLimit: args.fileLimit,
+      responseLimit: args.responseLimit,
+    };
   }
 
-  const query = args.queryContains?.toLowerCase() ?? '';
-  const matched = parsed.data
-    .filter((search) => search.searchText.toLowerCase().includes(query))
-    .map(summary)
-    .sort((a, b) => compareText(a.searchId.toLowerCase(), b.searchId.toLowerCase()));
-  return page(matched, args.offset, args.limit);
-}
+  async function searchResults(raw: unknown, signal?: AbortSignal) {
+    const args = input(searchResultsInput, raw);
+    const response = await client.request(`/searches/${args.searchId}?includeResponses=true`, {
+      signal,
+    });
+    const parsed = upstreamSearch.safeParse(response);
+    if (!parsed.success || parsed.data.id.toLowerCase() !== args.searchId.toLowerCase()) {
+      throw new SlskdError(
+        'INVALID_RESPONSE',
+        'slskd returned an unexpected search response shape or identity.',
+      );
+    }
 
-export async function searchStop(
-  raw: unknown,
-  env: Environment = process.env,
-  signal?: AbortSignal,
-) {
-  const { searchId } = input(searchIdInput, raw);
-  await requestJson(readConfig(env), `/searches/${searchId}`, {
-    method: 'PUT',
-    emptyResponseStatus: 200,
-    operationId: searchId,
-    signal,
-  });
-  return { searchId, stopRequested: true as const };
-}
+    const files = new Map<string, SearchFile>();
+    let receivedFileCount = 0;
+    for (const peer of parsed.data.responses) {
+      for (const file of peer.files) {
+        receivedFileCount++;
+        // Locked results cannot be treated as ordinary selectable downloads.
+        if (file.isLocked) {
+          continue;
+        }
+        const identity = JSON.stringify([peer.username, file.filename, file.size]);
+        if (!files.has(identity)) {
+          files.set(identity, {
+            ...projectFile(file, peer.username),
+            freeUploadSlots: peer.hasFreeUploadSlot ?? null,
+            queueLength: peer.queueLength ?? null,
+            uploadSpeedBytesPerSecond: peer.uploadSpeed ?? null,
+          });
+        }
+      }
+    }
 
-export async function searchDelete(
-  raw: unknown,
-  env: Environment = process.env,
-  signal?: AbortSignal,
-) {
-  const { searchId } = input(searchIdInput, raw);
-  await requestJson(readConfig(env), `/searches/${searchId}`, {
-    method: 'DELETE',
-    emptyResponseStatus: 204,
-    operationId: searchId,
-    signal,
-  });
-  return { searchId, deleted: true as const };
+    const matched = [...files.values()].filter((file) => matchesFilters(file, args.filters));
+    matched.sort((a, b) => order(a, b, args.sort));
+    return {
+      ...summary(parsed.data),
+      receivedFileCount,
+      ...page(matched, args.offset, args.limit),
+    };
+  }
+
+  async function searchList(raw: unknown, signal?: AbortSignal) {
+    const args = input(searchListInput, raw);
+    const response = await client.request('/searches', { signal });
+    const parsed = z.array(upstreamSummary).safeParse(response);
+    if (!parsed.success) {
+      throw new SlskdError('INVALID_RESPONSE', 'slskd returned an unexpected search list shape.');
+    }
+
+    const query = args.queryContains?.toLowerCase() ?? '';
+    const matched = parsed.data
+      .filter((search) => search.searchText.toLowerCase().includes(query))
+      .map(summary)
+      .sort((a, b) => compareText(a.searchId.toLowerCase(), b.searchId.toLowerCase()));
+    return page(matched, args.offset, args.limit);
+  }
+
+  async function searchStop(raw: unknown, signal?: AbortSignal) {
+    const { searchId } = input(searchIdInput, raw);
+    await client.request(`/searches/${searchId}`, {
+      method: 'PUT',
+      emptyResponseStatus: 200,
+      operationId: searchId,
+      signal,
+    });
+    return { searchId, stopRequested: true as const };
+  }
+
+  async function searchDelete(raw: unknown, signal?: AbortSignal) {
+    const { searchId } = input(searchIdInput, raw);
+    await client.request(`/searches/${searchId}`, {
+      method: 'DELETE',
+      emptyResponseStatus: 204,
+      operationId: searchId,
+      signal,
+    });
+    return { searchId, deleted: true as const };
+  }
+
+  return { searchStart, searchResults, searchList, searchStop, searchDelete };
 }

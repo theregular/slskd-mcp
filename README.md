@@ -23,7 +23,7 @@ chmod 600 .env
 
 Set `SLSKD_API_KEY` in `.env` to an API key configured in your own slskd. For a temporary test, you can use `SLSKD_BEARER_TOKEN` from a dashboard session instead. Set only one credential. No credentials are included or automatically collected by this project. A bearer token expires; use a dedicated API key for eventual persistent registration.
 
-`SLSKD_URL` defaults to `http://127.0.0.1:5030`; omit `/api/v0`. `SLSKD_TIMEOUT_MS` defaults to 5000. Configuration errors are returned as tool errors, so missing credentials do not prevent MCP initialization.
+`SLSKD_URL` defaults to `http://127.0.0.1:5030`; omit `/api/v0`. `SLSKD_TIMEOUT_MS` defaults to 5000. Configuration is read and validated once at startup. Invalid URLs, timeouts, or conflicting credentials stop startup with a sanitized diagnostic. Missing credentials still allow MCP initialization and tool discovery; API operations return `AUTH_NOT_CONFIGURED` before sending a request.
 
 ## Run a single MCP test
 
@@ -49,7 +49,7 @@ Example result:
 }
 ```
 
-A disconnected Soulseek session returns a successful status result with `readyToSearch: false`. Configuration, authentication, network, timeout and response-format failures return MCP `isError: true` and a concise error code. Raw HTTP error bodies are never returned. Redirects are not followed.
+A disconnected Soulseek session returns a successful status result with `readyToSearch: false`. Missing-credential, authentication, network, timeout and response-format failures return MCP `isError: true` and a concise error code. Raw HTTP error bodies are never returned. Redirects are not followed.
 
 ## Search
 
@@ -329,10 +329,26 @@ Generated output, dependencies, and local environment files are excluded. Enable
 
 TypeScript and typescript-eslint are pinned to compatible versions. Update them together when upgrading the toolchain.
 
+## Client structure
+
+`src/index.ts` reads the environment once, creates a configured slskd client, and passes it to the MCP server. Status, search, peer, and download operations retain their shared HTTP client in closures. Operation calls accept arguments and an optional cancellation signal; they do not read environment variables. Each client keeps its own configuration snapshot, so tests can create independent clients without changing global state.
+
+```ts
+const config = readConfig(process.env);
+const slskd = createSlskdClient(config);
+const server = createServer(slskd);
+
+await slskd.searchList({ queryContains: 'artist' }, signal);
+```
+
+Changing configuration requires constructing a new client. The HTTP transport owns credentials, URL prefixes, ordinary and peer request deadlines, and response/error handling.
+
 ## Files
 
 - `src/status.ts`: existing connection-status projection.
-- `src/config.ts`, `src/client.ts`, `src/errors.ts`: shared configuration, HTTP, and errors.
+- `src/config.ts`: environment parsing and validated, immutable configuration.
+- `src/client.ts`: configured slskd client combining status, search, peer, and download operations.
+- `src/http.ts`, `src/errors.ts`: shared HTTP transport and sanitized errors.
 - `src/search.ts`, `src/files.ts`: search and lifecycle tools, runtime schemas, filters, sorting, and pages.
 - `src/peers.ts`: peer info, library summaries, and directory file projections.
 - `src/downloads.ts`: batch enqueue, transfer status, cancellation, and history cleanup.
@@ -343,7 +359,8 @@ TypeScript and typescript-eslint are pinned to compatible versions. Update them 
 - `scripts/check-search-lifecycle.ts`: narrated start/list/stop/read/delete smoke client.
 - `scripts/check-browse.ts`: narrated peer info/library/directory smoke client.
 - `scripts/check-download.ts`: narrated selected-file download smoke client.
-- `test/downloads.test.ts`: download contracts, gating, failures, and stdio tests.
+- `test/client.test.ts`: client isolation, configuration snapshots, missing credentials, and startup diagnostics.
+- `test/downloads.test.ts`: download contracts, failures, and stdio tests.
 - `test/status.test.ts`, `test/search.test.ts`, `test/lifecycle.test.ts`, `test/peers.test.ts`: fake-HTTP and real-stdio regression tests.
 
 ## References

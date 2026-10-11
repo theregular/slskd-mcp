@@ -1,7 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { readConfig, readPeerConfig, type Environment } from './config.js';
-import { requestJson } from './client.js';
+import { type HttpClient } from './http.js';
 import { SlskdError, unknownOutcome } from './errors.js';
 import { compareText, nonnegativeInteger, page, pageInputShape } from './files.js';
 import { usernameSchema } from './peers.js';
@@ -234,200 +233,174 @@ function validateBatch(batch: z.infer<typeof upstreamBatch>, batchId: string) {
   }
 }
 
-export async function downloadQueue(
-  raw: unknown,
-  env: Environment = process.env,
-  signal?: AbortSignal,
-) {
-  const args = parse(downloadQueueInput, raw, 'INVALID_ARGUMENT');
-  const batchId = args.requestId ?? randomUUID();
-  const response = await requestJson(readPeerConfig(env), '/transfers/downloads/batches', {
-    method: 'POST',
-    operationId: batchId,
-    signal,
-    body: {
-      id: batchId,
-      username: args.username,
-      files: args.files.map((file) => ({ filename: file.filename, size: file.sizeBytes })),
-      ...(args.searchId ? { searchId: args.searchId } : {}),
-    },
-  });
-  try {
-    const { batch, failures } = parse(queueResponse, response, 'INVALID_RESPONSE');
-    validateBatch(batch, batchId);
-    if (batch.username !== args.username) {
-      throw new Error('Wrong peer.');
-    }
-    const requested = new Map(args.files.map((file) => [file.filename, file]));
-    const failed = new Set(failures.map((failure) => failure.filename));
-    if (
-      failed.size !== failures.length ||
-      failures.some((failure) => !requested.has(failure.filename))
-    ) {
-      throw new Error('Unexpected failures.');
-    }
-    const associations = new Map<string, string>();
-    for (const transfer of batch.transfers) {
+export function createDownloadOperations(client: HttpClient) {
+  async function downloadQueue(raw: unknown, signal?: AbortSignal) {
+    const args = parse(downloadQueueInput, raw, 'INVALID_ARGUMENT');
+    const batchId = args.requestId ?? randomUUID();
+    const response = await client.requestPeer('/transfers/downloads/batches', {
+      method: 'POST',
+      operationId: batchId,
+      signal,
+      body: {
+        id: batchId,
+        username: args.username,
+        files: args.files.map((file) => ({ filename: file.filename, size: file.sizeBytes })),
+        ...(args.searchId ? { searchId: args.searchId } : {}),
+      },
+    });
+    try {
+      const { batch, failures } = parse(queueResponse, response, 'INVALID_RESPONSE');
+      validateBatch(batch, batchId);
+      if (batch.username !== args.username) {
+        throw new Error('Wrong peer.');
+      }
+      const requested = new Map(args.files.map((file) => [file.filename, file]));
+      const failed = new Set(failures.map((failure) => failure.filename));
       if (
-        requested.get(transfer.filename)?.sizeBytes !== transfer.size ||
-        associations.has(transfer.filename)
+        failed.size !== failures.length ||
+        failures.some((failure) => !requested.has(failure.filename))
       ) {
-        throw new Error('Unexpected transfer.');
+        throw new Error('Unexpected failures.');
       }
-      associations.set(transfer.filename, transfer.id);
-    }
-    const accepted = args.files
-      .filter((file) => !failed.has(file.filename))
-      .map((file) => ({ ...file, transferId: associations.get(file.filename) ?? null }));
-    return {
-      batchId,
-      outcome:
-        accepted.length === 0
-          ? ('rejected' as const)
-          : failures.length
-            ? ('partial' as const)
-            : ('accepted' as const),
-      requestedCount: args.files.length,
-      acceptedCount: accepted.length,
-      failedCount: failures.length,
-      accepted,
-      failures: failures.map((failure) => ({
-        filename: failure.filename,
-        code: 'ENQUEUE_REJECTED' as const,
-        message:
-          'slskd did not accept this file for enqueueing. It may already be queued or an upstream error occurred.',
-      })),
-    };
-  } catch {
-    throw unknownOutcome(batchId);
-  }
-}
-
-export async function downloadList(
-  raw: unknown,
-  env: Environment = process.env,
-  signal?: AbortSignal,
-) {
-  const args = parse(downloadListInput, raw, 'INVALID_ARGUMENT');
-  const response = await requestJson(
-    readConfig(env),
-    `/transfers/downloads?includeRemoved=${args.includeRemoved}`,
-    { signal },
-  );
-  const groups = parse(groupedDownloads, response, 'INVALID_RESPONSE');
-  const transfers: z.infer<typeof transferOutput>[] = [];
-  const seen = new Set<string>();
-  for (const group of groups) {
-    for (const directory of group.directories) {
-      for (const item of directory.files) {
-        if (item.username !== group.username || seen.has(item.id.toLowerCase())) {
-          throw new SlskdError(
-            'INVALID_RESPONSE',
-            'slskd returned inconsistent grouped transfer identities.',
-          );
-        }
-        seen.add(item.id.toLowerCase());
+      const associations = new Map<string, string>();
+      for (const transfer of batch.transfers) {
         if (
-          (!args.includeRemoved && item.removed) ||
-          (args.username !== undefined && item.username !== args.username) ||
-          (args.states?.length && !args.states.includes(item.state))
+          requested.get(transfer.filename)?.sizeBytes !== transfer.size ||
+          associations.has(transfer.filename)
         ) {
-          continue;
+          throw new Error('Unexpected transfer.');
         }
-        transfers.push(project(item));
+        associations.set(transfer.filename, transfer.id);
       }
+      const accepted = args.files
+        .filter((file) => !failed.has(file.filename))
+        .map((file) => ({ ...file, transferId: associations.get(file.filename) ?? null }));
+      return {
+        batchId,
+        outcome:
+          accepted.length === 0
+            ? ('rejected' as const)
+            : failures.length
+              ? ('partial' as const)
+              : ('accepted' as const),
+        requestedCount: args.files.length,
+        acceptedCount: accepted.length,
+        failedCount: failures.length,
+        accepted,
+        failures: failures.map((failure) => ({
+          filename: failure.filename,
+          code: 'ENQUEUE_REJECTED' as const,
+          message:
+            'slskd did not accept this file for enqueueing. It may already be queued or an upstream error occurred.',
+        })),
+      };
+    } catch {
+      throw unknownOutcome(batchId);
     }
   }
-  return page(transfers.sort(order), args.offset, args.limit);
-}
 
-async function singleTransfer(
-  username: string,
-  transferId: string,
-  env: Environment,
-  signal?: AbortSignal,
-) {
-  const response = await requestJson(
-    readConfig(env),
-    `/transfers/downloads/${encodeURIComponent(username)}/${transferId}`,
-    { signal },
-  );
-  const transfer = parse(upstreamTransfer, response, 'INVALID_RESPONSE');
-  if (transfer.username !== username || !sameId(transfer.id, transferId)) {
-    throw new SlskdError(
-      'INVALID_ARGUMENT',
-      'The returned transfer does not match the requested username and ID.',
-    );
-  }
-  return transfer;
-}
-
-export async function downloadStatus(
-  raw: unknown,
-  env: Environment = process.env,
-  signal?: AbortSignal,
-) {
-  const args = parse(downloadStatusInput, raw, 'INVALID_ARGUMENT');
-  if (args.batchId !== undefined) {
-    const response = await requestJson(
-      readConfig(env),
-      `/transfers/downloads/batches/${args.batchId}`,
+  async function downloadList(raw: unknown, signal?: AbortSignal) {
+    const args = parse(downloadListInput, raw, 'INVALID_ARGUMENT');
+    const response = await client.request(
+      `/transfers/downloads?includeRemoved=${args.includeRemoved}`,
       { signal },
     );
-    const batch = parse(upstreamBatch, response, 'INVALID_RESPONSE');
-    validateBatch(batch, args.batchId);
-    const items = batch.transfers
-      .map((item) => ({ ...project(item), available: !item.removed }))
-      .sort(order);
+    const groups = parse(groupedDownloads, response, 'INVALID_RESPONSE');
+    const transfers: z.infer<typeof transferOutput>[] = [];
+    const seen = new Set<string>();
+    for (const group of groups) {
+      for (const directory of group.directories) {
+        for (const item of directory.files) {
+          if (item.username !== group.username || seen.has(item.id.toLowerCase())) {
+            throw new SlskdError(
+              'INVALID_RESPONSE',
+              'slskd returned inconsistent grouped transfer identities.',
+            );
+          }
+          seen.add(item.id.toLowerCase());
+          if (
+            (!args.includeRemoved && item.removed) ||
+            (args.username !== undefined && item.username !== args.username) ||
+            (args.states?.length && !args.states.includes(item.state))
+          ) {
+            continue;
+          }
+          transfers.push(project(item));
+        }
+      }
+    }
+    return page(transfers.sort(order), args.offset, args.limit);
+  }
+
+  async function singleTransfer(username: string, transferId: string, signal?: AbortSignal) {
+    const response = await client.request(
+      `/transfers/downloads/${encodeURIComponent(username)}/${transferId}`,
+      { signal },
+    );
+    const transfer = parse(upstreamTransfer, response, 'INVALID_RESPONSE');
+    if (transfer.username !== username || !sameId(transfer.id, transferId)) {
+      throw new SlskdError(
+        'INVALID_ARGUMENT',
+        'The returned transfer does not match the requested username and ID.',
+      );
+    }
+    return transfer;
+  }
+
+  async function downloadStatus(raw: unknown, signal?: AbortSignal) {
+    const args = parse(downloadStatusInput, raw, 'INVALID_ARGUMENT');
+    if (args.batchId !== undefined) {
+      const response = await client.request(`/transfers/downloads/batches/${args.batchId}`, {
+        signal,
+      });
+      const batch = parse(upstreamBatch, response, 'INVALID_RESPONSE');
+      validateBatch(batch, args.batchId);
+      const items = batch.transfers
+        .map((item) => ({ ...project(item), available: !item.removed }))
+        .sort(order);
+      return {
+        kind: 'batch' as const,
+        batchId: args.batchId,
+        ...page(items, args.offset ?? 0, args.limit ?? 25),
+      };
+    }
+    const transfer = await singleTransfer(args.username!, args.transferId!, signal);
     return {
-      kind: 'batch' as const,
-      batchId: args.batchId,
-      ...page(items, args.offset ?? 0, args.limit ?? 25),
+      kind: 'transfer' as const,
+      item: project(transfer),
+      fetchedAt: new Date().toISOString(),
     };
   }
-  const transfer = await singleTransfer(args.username!, args.transferId!, env, signal);
-  return {
-    kind: 'transfer' as const,
-    item: project(transfer),
-    fetchedAt: new Date().toISOString(),
-  };
-}
 
-export async function downloadCancel(
-  raw: unknown,
-  env: Environment = process.env,
-  signal?: AbortSignal,
-) {
-  const args = parse(downloadCancelInput, raw, 'INVALID_ARGUMENT');
-  await singleTransfer(args.username, args.transferId, env, signal);
-  await requestJson(
-    readConfig(env),
-    `/transfers/downloads/${encodeURIComponent(args.username)}/${args.transferId}?remove=${args.remove}`,
-    {
+  async function downloadCancel(raw: unknown, signal?: AbortSignal) {
+    const args = parse(downloadCancelInput, raw, 'INVALID_ARGUMENT');
+    await singleTransfer(args.username, args.transferId, signal);
+    await client.request(
+      `/transfers/downloads/${encodeURIComponent(args.username)}/${args.transferId}?remove=${args.remove}`,
+      {
+        method: 'DELETE',
+        emptyResponseStatus: 204,
+        operationId: args.transferId,
+        signal,
+      },
+    );
+    return {
+      username: args.username,
+      transferId: args.transferId,
+      cancelRequested: true as const,
+      removed: args.remove,
+    };
+  }
+
+  async function downloadClearCompleted(raw: unknown, signal?: AbortSignal) {
+    parse(downloadClearInput, raw, 'INVALID_ARGUMENT');
+    await client.request('/transfers/downloads/all/completed', {
       method: 'DELETE',
       emptyResponseStatus: 204,
-      operationId: args.transferId,
       signal,
-    },
-  );
-  return {
-    username: args.username,
-    transferId: args.transferId,
-    cancelRequested: true as const,
-    removed: args.remove,
-  };
-}
+    });
+    return { cleared: true as const, scope: 'all_completed' as const };
+  }
 
-export async function downloadClearCompleted(
-  raw: unknown,
-  env: Environment = process.env,
-  signal?: AbortSignal,
-) {
-  parse(downloadClearInput, raw, 'INVALID_ARGUMENT');
-  await requestJson(readConfig(env), '/transfers/downloads/all/completed', {
-    method: 'DELETE',
-    emptyResponseStatus: 204,
-    signal,
-  });
-  return { cleared: true as const, scope: 'all_completed' as const };
+  return { downloadQueue, downloadList, downloadStatus, downloadCancel, downloadClearCompleted };
 }

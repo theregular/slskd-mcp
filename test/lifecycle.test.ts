@@ -5,19 +5,16 @@ import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
-import {
-  searchList,
-  searchStop,
-  searchDelete,
-  searchResults,
-  searchListOutput,
-} from '../src/search.js';
+import { createSlskdClient } from '../src/client.js';
+import { readConfig } from '../src/config.js';
+import { searchListOutput } from '../src/search.js';
 import { SlskdError, errorResult } from '../src/errors.js';
 
 const id = '550e8400-e29b-41d4-a716-446655440000';
 const otherId = '660e8400-e29b-41d4-a716-446655440000';
 const key = 'private-test-key';
 const envFor = (base: string) => ({ SLSKD_URL: base, SLSKD_API_KEY: key });
+const clientFor = (base: string) => createSlskdClient(readConfig(envFor(base)));
 const record = (extra = {}) => ({ id, searchText: 'Bach [live]', state: 'InProgress', ...extra });
 function json(res: ServerResponse, value: unknown) {
   res.setHeader('Content-Type', 'application/json');
@@ -55,8 +52,8 @@ test('list filters literal queries, sorts IDs, projects compact summaries and pa
       ]);
     },
     async (base) => {
-      const env = envFor(base + '/prefix');
-      const result = await searchList({ queryContains: 'BACH [LIVE]', offset: 1, limit: 1 }, env);
+      const slskd = clientFor(base + '/prefix');
+      const result = await slskd.searchList({ queryContains: 'BACH [LIVE]', offset: 1, limit: 1 });
       assert.equal(searchListOutput.safeParse(result).success, true);
       assert.deepEqual(result.items, [
         {
@@ -69,12 +66,12 @@ test('list filters literal queries, sorts IDs, projects compact summaries and pa
       assert.equal(result.matchedCount, 2);
       assert.equal(result.hasMore, false);
       assert(!JSON.stringify(result).includes(key));
-      const first = await searchList({ limit: 1 }, env);
+      const first = await slskd.searchList({ limit: 1 });
       assert.equal(first.items[0]?.searchId, id);
       assert.equal(first.items[0]?.isComplete, true);
       assert.equal(first.hasMore, true);
-      assert.equal((await searchList({ queryContains: '.*' }, env)).matchedCount, 0);
-      assert.deepEqual((await searchList({ offset: 100 }, env)).items, []);
+      assert.equal((await slskd.searchList({ queryContains: '.*' })).matchedCount, 0);
+      assert.deepEqual((await slskd.searchList({ offset: 100 })).items, []);
     },
   );
 });
@@ -92,10 +89,12 @@ test('list distinguishes empty collections from malformed JSON and summary shape
         res.end(payload);
       },
       async (base) => {
+        const slskd = clientFor(base);
+
         if (payload === '[]') {
-          assert.equal((await searchList({}, envFor(base))).matchedCount, 0);
+          assert.equal((await slskd.searchList({})).matchedCount, 0);
         } else {
-          await assert.rejects(searchList({}, envFor(base)), { code: 'INVALID_RESPONSE' });
+          await assert.rejects(slskd.searchList({}), { code: 'INVALID_RESPONSE' });
         }
       },
     );
@@ -110,20 +109,25 @@ test('lifecycle inputs and pre-dispatch cancellation never send requests', async
       res.end();
     },
     async (base) => {
-      const env = envFor(base);
+      const slskd = clientFor(base);
       for (const raw of [{ limit: 101 }, { offset: -1 }, { queryContains: 1 }, { url: base }]) {
-        await assert.rejects(searchList(raw, env), { code: 'INVALID_ARGUMENT' });
+        await assert.rejects(slskd.searchList(raw), { code: 'INVALID_ARGUMENT' });
       }
-      for (const fn of [searchStop, searchDelete]) {
+      for (const fn of ['searchStop', 'searchDelete'] as const) {
         for (const raw of [{ searchId: '../all' }, { searchId: id, all: true }, {}]) {
-          await assert.rejects(fn(raw, env), { code: 'INVALID_ARGUMENT' });
+          await assert.rejects(slskd[fn](raw), { code: 'INVALID_ARGUMENT' });
         }
-        await assert.rejects(fn({ searchId: id }, env, AbortSignal.abort()), { code: 'CANCELLED' });
-        await assert.rejects(fn({ searchId: id }, { SLSKD_URL: base }), {
-          code: 'AUTH_NOT_CONFIGURED',
+        await assert.rejects(slskd[fn]({ searchId: id }, AbortSignal.abort()), {
+          code: 'CANCELLED',
         });
+        await assert.rejects(
+          createSlskdClient(readConfig({ SLSKD_URL: base }))[fn]({ searchId: id }),
+          {
+            code: 'AUTH_NOT_CONFIGURED',
+          },
+        );
       }
-      await assert.rejects(searchList({}, env, AbortSignal.abort()), { code: 'CANCELLED' });
+      await assert.rejects(slskd.searchList({}, AbortSignal.abort()), { code: 'CANCELLED' });
       assert.equal(requests, 0);
     },
   );
@@ -145,12 +149,12 @@ test('stop and delete use exact prefixed paths, no body, and accept empty 200/20
       res.end();
     },
     async (base) => {
-      const env = envFor(base + '/prefix/');
-      assert.deepEqual(await searchStop({ searchId: id }, env), {
+      const slskd = clientFor(base + '/prefix/');
+      assert.deepEqual(await slskd.searchStop({ searchId: id }), {
         searchId: id,
         stopRequested: true,
       });
-      assert.deepEqual(await searchDelete({ searchId: id }, env), { searchId: id, deleted: true });
+      assert.deepEqual(await slskd.searchDelete({ searchId: id }), { searchId: id, deleted: true });
       assert.deepEqual(seen, ['PUT', 'DELETE']);
     },
   );
@@ -169,10 +173,10 @@ test('disappearance after listing yields NOT_FOUND for stop/delete, never a fals
       }
     },
     async (base) => {
-      const env = envFor(base);
-      assert.equal((await searchList({}, env)).items[0]?.searchId, id);
-      for (const fn of [searchStop, searchDelete]) {
-        await assert.rejects(fn({ searchId: id }, env), { code: 'NOT_FOUND' });
+      const slskd = clientFor(base);
+      assert.equal((await slskd.searchList({})).items[0]?.searchId, id);
+      for (const fn of ['searchStop', 'searchDelete'] as const) {
+        await assert.rejects(slskd[fn]({ searchId: id }), { code: 'NOT_FOUND' });
       }
       assert.equal(mutations, 2);
     },
@@ -180,7 +184,7 @@ test('disappearance after listing yields NOT_FOUND for stop/delete, never a fals
 });
 
 test('lifecycle writes never retry ambiguous transport failures, cancellation, timeouts or unexpected success statuses', async () => {
-  for (const fn of [searchStop, searchDelete]) {
+  for (const fn of ['searchStop', 'searchDelete'] as const) {
     for (const mode of ['disconnect', 'timeout', 'cancel', '500', '202', 'wrong-success']) {
       let calls = 0;
       const abort = new AbortController();
@@ -194,13 +198,16 @@ test('lifecycle writes never retry ambiguous transport failures, cancellation, t
             abort.abort();
           } else if (mode !== 'timeout') {
             res.statusCode =
-              mode === 'wrong-success' ? (fn === searchStop ? 204 : 200) : Number(mode);
+              mode === 'wrong-success' ? (fn === 'searchStop' ? 204 : 200) : Number(mode);
             res.end(key);
           }
         },
         async (base) => {
           await assert.rejects(
-            fn({ searchId: id }, { ...envFor(base), SLSKD_TIMEOUT_MS: '100' }, abort.signal),
+            createSlskdClient(readConfig({ ...envFor(base), SLSKD_TIMEOUT_MS: '100' }))[fn](
+              { searchId: id },
+              abort.signal,
+            ),
             (error: unknown) => {
               assert(error instanceof SlskdError);
               assert.equal(error.code, 'OUTCOME_UNKNOWN');
@@ -217,7 +224,7 @@ test('lifecycle writes never retry ambiguous transport failures, cancellation, t
 });
 
 test('definite lifecycle write rejections stay sanitized and are not retried', async () => {
-  for (const fn of [searchStop, searchDelete]) {
+  for (const fn of ['searchStop', 'searchDelete'] as const) {
     for (const [status, code] of [
       [400, 'INVALID_ARGUMENT'],
       [401, 'UNAUTHORIZED'],
@@ -234,7 +241,9 @@ test('definite lifecycle write rejections stay sanitized and are not retried', a
           res.end(key);
         },
         async (base) => {
-          await assert.rejects(fn({ searchId: id }, envFor(base)), (error: unknown) => {
+          const slskd = clientFor(base);
+
+          await assert.rejects(slskd[fn]({ searchId: id }), (error: unknown) => {
             assert(error instanceof SlskdError);
             assert.equal(error.code, code);
             assert(!JSON.stringify(errorResult(error)).includes(key));
@@ -292,6 +301,8 @@ test('real stdio exercises all six tools, preserving stopped results and unrelat
       }
     },
     async (base) => {
+      const slskd = clientFor(base);
+
       const client = new Client({ name: 'lifecycle-test', version: '1.0.0' });
       const transport = new StdioClientTransport({
         command: process.execPath,
@@ -379,7 +390,7 @@ test('real stdio exercises all six tools, preserving stopped results and unrelat
           [otherId],
         );
         assert.deepEqual(mutations, [`PUT ${ownId}`, `PUT ${ownId}`, `DELETE ${ownId}`]);
-        await assert.rejects(searchResults({ searchId: ownId }, envFor(base)), {
+        await assert.rejects(slskd.searchResults({ searchId: ownId }), {
           code: 'NOT_FOUND',
         });
       } finally {

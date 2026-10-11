@@ -60,7 +60,7 @@ Proposed additions, introduced with their consumers:
 | ----------------------- | ------- | --------------------------------------------------------------------------- |
 | `SLSKD_PEER_TIMEOUT_MS` | 30000   | Integer 100–120000; stage 3 peer browse/info and stage 4 enqueue operations |
 
-Read environment configuration at server creation/tool execution using the existing testable environment injection pattern. Invalid relevant configuration becomes a sanitized tool error; missing credentials must not prevent MCP initialization. All fourteen tools are registered unconditionally. The obsolete `SLSKD_ENABLE_DOWNLOADS` setting is ignored.
+Read and validate environment configuration once in the entry point. Create one configured slskd client per MCP server; domain operations retain the shared HTTP client and accept operation arguments and optional cancellation signals. Tests construct independent clients with fixture configuration. Invalid URLs, deadlines, or conflicting credentials stop startup with sanitized diagnostics. Missing credentials must not prevent MCP initialization; reject API operations with `AUTH_NOT_CONFIGURED` before HTTP dispatch. All fourteen tools are registered unconditionally. The obsolete `SLSKD_ENABLE_DOWNLOADS` setting is ignored.
 
 For new endpoints, abort response reading above 32 MiB, even when Content-Length is absent. A read size limit must produce `RESPONSE_TOO_LARGE`, never a silently truncated success. An oversized mutation response produces `OUTCOME_UNKNOWN`, since the write may have succeeded. Keep timeout protection active through body reading. These are response bounds, not file-download limits; slskd transfers file bytes itself.
 

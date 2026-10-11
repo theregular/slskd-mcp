@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import { browseUserOutput, browseDirectoryOutput, userInfoOutput } from '../src/peers.js';
-import { readPeerConfig } from '../src/config.js';
+import { readConfig } from '../src/config.js';
 
 const args = process.argv.slice(2).filter((arg) => arg !== '--');
 const [username, directory] = args;
@@ -24,7 +24,7 @@ if (args.length !== 2 || !username?.trim() || !directory?.trim()) {
     stderr: 'inherit',
   });
   try {
-    const timeout = readPeerConfig(env).timeout + 5000;
+    const timeout = readConfig(env).peerTimeout + 5000;
     await client.connect(transport);
     const { tools } = await client.listTools();
     const expected = ['browse_user', 'browse_directory', 'user_info'];

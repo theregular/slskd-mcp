@@ -3,8 +3,9 @@ import assert from 'node:assert/strict';
 import { createServer as httpServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
+import { createSlskdClient } from '../src/client.js';
 import { fileURLToPath } from 'node:url';
-import { connectionStatus, readConfig, type Environment } from '../src/status.js';
+import { readConfig, type Environment } from '../src/config.js';
 
 type Handler = (req: IncomingMessage, res: ServerResponse) => void;
 
@@ -30,9 +31,10 @@ function response(res: ServerResponse, data: unknown) {
 
 const key = 'test-secret-must-not-leak';
 const envFor = (url: string): Environment => ({ SLSKD_URL: url, SLSKD_API_KEY: key });
+const clientFor = (base: string) => createSlskdClient(readConfig(envFor(base)));
 
 test('validates configuration without revealing credentials', () => {
-  assert.throws(() => readConfig({}), { code: 'AUTH_NOT_CONFIGURED' });
+  assert.deepEqual(readConfig({}).headers, { Accept: 'application/json' });
   assert.throws(
     () => readConfig({ ...envFor('http://user:secret@localhost'), SLSKD_TIMEOUT_MS: '1' }),
     { code: 'CONFIG_ERROR' },
@@ -59,7 +61,7 @@ test('uses only the two GET endpoints, preserves URL prefix, reports readiness',
       );
     },
     async (base) => {
-      assert.deepEqual(await connectionStatus(envFor(base + '/slskd/')), {
+      assert.deepEqual(await clientFor(base + '/slskd/').connectionStatus(), {
         reachable: true,
         authenticated: true,
         version: '0.26.0',
@@ -85,7 +87,9 @@ test('reachable API with disconnected Soulseek is not ready to search', async ()
         req.url?.endsWith('/version') ? '0.26.0' : { isConnected: false, isLoggedIn: false },
       ),
     async (base) => {
-      const status = await connectionStatus(envFor(base));
+      const slskd = clientFor(base);
+
+      const status = await slskd.connectionStatus();
       assert.equal(status.reachable, true);
       assert.equal(status.readyToSearch, false);
     },
@@ -104,7 +108,9 @@ test('bearer session authentication works', async () => {
       );
     },
     async (base) => {
-      const status = await connectionStatus({ SLSKD_URL: base, SLSKD_BEARER_TOKEN: key });
+      const status = await createSlskdClient(
+        readConfig({ SLSKD_URL: base, SLSKD_BEARER_TOKEN: key }),
+      ).connectionStatus();
       assert.equal(status.readyToSearch, false);
     },
   );
@@ -123,7 +129,9 @@ for (const [httpStatus, code] of [
         res.end(key);
       },
       async (base) => {
-        await assert.rejects(connectionStatus(envFor(base)), (error: unknown) => {
+        const slskd = clientFor(base);
+
+        await assert.rejects(slskd.connectionStatus(), (error: unknown) => {
           assert(error instanceof Error);
           assert(!error.message.includes(key));
           return (error as Error & { code: string }).code === code;
@@ -138,7 +146,9 @@ test('rejects invalid JSON and unexpected response shapes', async () => {
     await fixture(
       (_req, res) => res.end(payload),
       async (base) => {
-        await assert.rejects(connectionStatus(envFor(base)), { code: 'INVALID_RESPONSE' });
+        const slskd = clientFor(base);
+
+        await assert.rejects(slskd.connectionStatus(), { code: 'INVALID_RESPONSE' });
       },
     );
   }
@@ -148,9 +158,14 @@ test('applies a bounded request timeout', async () => {
   await fixture(
     () => {},
     async (base) => {
-      await assert.rejects(connectionStatus({ ...envFor(base), SLSKD_TIMEOUT_MS: '100' }), {
-        code: 'TIMEOUT',
-      });
+      await assert.rejects(
+        createSlskdClient(
+          readConfig({ ...envFor(base), SLSKD_TIMEOUT_MS: '100' }),
+        ).connectionStatus(),
+        {
+          code: 'TIMEOUT',
+        },
+      );
     },
   );
 });
@@ -170,7 +185,9 @@ test('does not follow redirects carrying credentials', async () => {
           res.end();
         },
         async (base) => {
-          await assert.rejects(connectionStatus(envFor(base)), { code: 'UNREACHABLE' });
+          const slskd = clientFor(base);
+
+          await assert.rejects(slskd.connectionStatus(), { code: 'UNREACHABLE' });
           assert.equal(reached, false);
         },
       );

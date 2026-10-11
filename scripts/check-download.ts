@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
-import { readPeerConfig } from '../src/config.js';
+import { readConfig } from '../src/config.js';
 import { browseDirectoryOutput } from '../src/peers.js';
 import { downloadQueueInput, downloadQueueOutput, downloadStatusOutput } from '../src/downloads.js';
 
@@ -37,7 +37,7 @@ if (args.length !== 3) {
       file.sizeBytes <= 20 * 1024 * 1024,
       'Smoke test is limited to one file of at most 20 MiB.',
     );
-    const timeout = readPeerConfig(env).timeout + 5000;
+    const timeout = readConfig(env).peerTimeout + 5000;
     await client.connect(transport);
     const { tools } = await client.listTools();
     assert(tools.some((tool) => tool.name === 'download_queue'));
